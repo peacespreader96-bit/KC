@@ -5,13 +5,16 @@ from fastapi.responses import JSONResponse
 app = FastAPI()
 
 print("⏳ Initializing DuckDB for Render...")
-db = duckdb.connect()
-db.execute("SET memory_limit='256MB';")
-db.execute("SET threads=1;") 
-db.execute("INSTALL httpfs; LOAD httpfs;")
 
-# 🔴 THE FIX: Correct DuckDB syntax to spoof the User-Agent
-db.execute("SET custom_user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';")
+# 🔴 FIX: Set the custom user-agent when creating the connection
+db = duckdb.connect(config={
+    'custom_user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+})
+
+# Render memory limits
+db.execute("SET memory_limit='256MB';")
+db.execute("SET threads=1;")
+db.execute("INSTALL httpfs; LOAD httpfs;")
 
 BASE_URL = "https://huggingface.co/buckets/CutehackX/icrm-hitek-full-db-mixed-bucket/resolve/"
 phone_urls = [f"{BASE_URL}idx_phone.{i}.parquet" for i in range(7)]
@@ -23,7 +26,7 @@ try:
 except Exception as e:
     print(f"❌ Error creating view: {e}")
 
-# 🟢 Helper to replace pandas and save memory
+# Helper to replace pandas and save memory
 def fetch_dicts(cursor):
     columns = [desc[0] for desc in cursor.description]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -39,7 +42,7 @@ def search(q: str = Query(...)):
         results = []
         
         if q.isdigit():
-            # 🟢 Parameterized query (Stops hackers)
+            # Parameterized query (Stops SQL injection)
             query = """
                 SELECT name, fathersName, phoneNumber, aadharNumber, otherNumber, address, district, pincode, state, town 
                 FROM people_phone 
@@ -48,7 +51,7 @@ def search(q: str = Query(...)):
             """
             results = fetch_dicts(db.execute(query, [q, q]))
         else:
-            # 🟢 Parameterized query (Stops hackers)
+            # Parameterized query (Stops SQL injection)
             query = """
                 SELECT name, fathersName, phoneNumber, aadharNumber, otherNumber, address, district, pincode, state, town 
                 FROM people_phone 
