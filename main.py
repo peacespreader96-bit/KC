@@ -6,6 +6,10 @@ from collections import OrderedDict
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 TOKEN        = "8723126732:AAHVFOySgFaWN4_4InqtKrvkgN15crbPi0w"
+
+# 🔴 PUT YOUR LIVE RENDER API URL HERE
+API_URL      = "https://kc-1-t1b9.onrender.com/search"
+
 ADMIN_ID     = 5505679330
 MAX_QUEUE    = 15
 HOURLY_LIMIT = 20
@@ -13,9 +17,6 @@ COOLDOWN_SEC = 3
 BOT_LINK     = "https://t.me/Karam_Chand_bot"
 DEV_LINK     = "https://t.me/ansafrozkhan"
 BASE_URL     = f"https://api.telegram.org/bot{TOKEN}"
-
-# 🔴 PUT YOUR RENDER API URL HERE
-API_URL      = "https://kc-1-t1b9.onrender.com/search"
 
 app = Flask(__name__)
 
@@ -29,13 +30,14 @@ search_queue  = queue.Queue()
 queue_lock    = threading.Lock()
 queue_order   = []
 
-search_cache  = OrderedDict() 
+# ─── CACHE ────────────────────────────────────────────────────────────────────
+search_cache = OrderedDict() 
 CACHE_SIZE = 500
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def clean_address(addr):
-    """Fixes the ! delimiter and extra spaces in the address."""
+    """Fixes the ! delimiter issue in the dataset."""
     if not addr: return ""
     clean = re.sub(r'!+', ', ', str(addr))
     clean = re.sub(r'\s+', ' ', clean).strip(', ')
@@ -90,15 +92,14 @@ def cb_answer(cb_id, text=""):
 def typing(chat_id):
     api_call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
-
-# ─── ALL STRINGS ──────────────────────────────────────────────────────────────
+# ─── STRINGS ──────────────────────────────────────────────────────────────────
 T = {
     "en": {
         "lang_pick": "🌐 <b>Select your language to continue:</b>",
         "welcome_new": "😎 <b>I am KaramChand.</b>\n\nI know everything. But I am not your servant.\n\n📱 <b>Mobile (10-digit):</b> Full record\n🪪 <b>Aadhar (12-digit):</b> Full record\n\n<i>Dev: @ansafrozkhan</i>",
         "welcome_back": "👋 Welcome back, <b>{name}</b>!\n\n📊 <b>Your Stats</b>\n🔍 Searches: <b>{s}</b>\n✅ Results: <b>{r}</b>\n\n🌍 <b>Global Stats</b>\n🔢 Searched: <b>{gs}</b>\n📦 Delivered: <b>{gr}</b>\n\n<i>Dev: @ansafrozkhan</i>",
         "stats": "📊 <b>Your Stats — {name}</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n🔍 Searches: <b>{s}</b>\n✅ Results: <b>{r}</b>\n\n🌍 <b>Global Stats</b>\n🔢 Total searched: <b>{gs}</b>\n📦 Total delivered: <b>{gr}</b>\n\n<i>Dev: @ansafrozkhan</i>",
-        "help": "ℹ️ <b>How to Use KaramChand</b>\n\n📱 <b>Mobile:</b> 10-digit number (no +91)\n🪪 <b>Aadhar:</b> 12-digit number\n\n❌ Mixed input (Rahul123) → rejected\n⏱ 3s cooldown between searches\n📋 Max <b>{lim}</b> searches/hour\n\n<i>Dev: @ansafrozkhan</i>",
+        "help": "ℹ️ <b>How to Use KaramChand</b>\n\n📱 <b>Mobile:</b> 10-digit number\n🪪 <b>Aadhar:</b> 12-digit number\n\n❌ Only numbers allowed (Names disabled)\n⏱ 3s cooldown between searches\n📋 Max <b>{lim}</b> searches/hour\n\n<i>Dev: @ansafrozkhan</i>",
         "q1": "⚡ <b>Searching...</b>\n🎯 <code>{q}</code>\n\n<i>Dev: @ansafrozkhan</i>",
         "qn": "📋 <b>Queue #{p}</b>  {bar}\n🎯 <code>{q}</code>\n⏳ Est. ~{eta}s\n\n<i>Dev: @ansafrozkhan</i>",
         "no_result": "❌ <b>No Records Found</b>\n\n<code>{q}</code> — nothing in the database.\nCheck spelling or try a different term.\n\n<i>Dev: @ansafrozkhan</i>",
@@ -121,13 +122,13 @@ T = {
         "welcome_new": "😎 <b>Main hoon KaramChand.</b>\n\nDuniya ki har cheez ki jankari hai mujhe. Par main tera naukar nahi.\n\n📱 <b>Mobile (10-digit):</b> Poori kundli\n🪪 <b>Aadhar (12-digit):</b> Poori kundli\n\n<i>Dev: @ansafrozkhan</i>",
         "welcome_back": "👋 Wapas aa gaya, <b>{name}</b>!\n\n📊 <b>Teri Stats</b>\n🔍 Searches: <b>{s}</b>\n✅ Results: <b>{r}</b>\n\n🌍 <b>Global Stats</b>\n🔢 Searched: <b>{gs}</b>\n📦 Delivered: <b>{gr}</b>\n\n<i>Dev: @ansafrozkhan</i>",
         "stats": "📊 <b>Teri Stats — {name}</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n🔍 Searches: <b>{s}</b>\n✅ Results: <b>{r}</b>\n\n🌍 <b>Global Stats</b>\n🔢 Total searched: <b>{gs}</b>\n📦 Total diye: <b>{gr}</b>\n\n<i>Dev: @ansafrozkhan</i>",
-        "help": "ℹ️ <b>KaramChand Kaise Use Kare</b>\n\n📱 <b>Mobile:</b> 10-digit number (+91 mat laga)\n🪪 <b>Aadhar:</b> 12-digit number\n\n❌ Mixed input Rahul123 → reject\n⏱ Har search ke beech 3s ruk\n📋 Max <b>{lim}</b> searches per ghante\n\n<i>Dev: @ansafrozkhan</i>",
+        "help": "ℹ️ <b>KaramChand Kaise Use Kare</b>\n\n📱 <b>Mobile:</b> 10-digit number\n🪪 <b>Aadhar:</b> 12-digit number\n\n❌ Sirf numbers allowed hain\n⏱ Har search ke beech 3s ruk\n📋 Max <b>{lim}</b> searches per ghante\n\n<i>Dev: @ansafrozkhan</i>",
         "q1": "⚡ <b>Dhoondh raha hoon...</b>\n🎯 <code>{q}</code>\n\n<i>Dev: @ansafrozkhan</i>",
         "qn": "📋 <b>Queue #{p}</b>  {bar}\n🎯 <code>{q}</code>\n⏳ ~{eta}s intezaar\n\n<i>Dev: @ansafrozkhan</i>",
         "no_result": "❌ <b>Koi Record Nahi Mila</b>\n\n<code>{q}</code> — database mein kuch nahi.\nSpelling check kar ya kuch aur try kar.\n\n<i>Dev: @ansafrozkhan</i>",
         "new_search": "🔍 <b>Nayi Search</b>\n\n10-digit mobile ya 12-digit Aadhar likh.\n\n<i>Dev: @ansafrozkhan</i>",
         "report_cap": "📄 <b>KaramChand Report</b>\n🔎 <code>{q}</code>\n\n<i>Dev: @ansafrozkhan</i>",
-        "e_digits": "❌ 10 ya 12-digit chahiye — tune <b>{n}</b>-digit bheja.\n+91 mat laga.\n\n<i>Dev: @ansafrozkhan</i>",
+        "e_digits": "❌ 10 ya 12-digit chahiye — tune <b>{n}</b>-digit bheja.\n\n<i>Dev: @ansafrozkhan</i>",
         "e_mixed": "❌ Sirf numbers allowed hain. Naam band hai.\n\n<i>Dev: @ansafrozkhan</i>",
         "e_cool": "⏳ 3 second ruk ja next search se pehle.\n\n<i>Dev: @ansafrozkhan</i>",
         "e_active": "🔄 Tera search chal raha hai. Result aane tak ruk.\n\n<i>Dev: @ansafrozkhan</i>",
@@ -144,7 +145,7 @@ T = {
         "welcome_new": "😎 <b>ನಾನು ಕರಮಚಂದ್.</b>\n\nಎಲ್ಲ ತಿಳಿದಿದೆ ನನಗೆ. ಆದರೆ ನಾನು ನಿನ್ನ ಆಳಲ್ಲ.\n\n📱 <b>ಮೊಬೈಲ್ (10-ಅಂಕಿ):</b> ಪೂರ್ಣ ವಿವರ\n🪪 <b>ಆಧಾರ್ (12-ಅಂಕಿ):</b> ಪೂರ್ಣ ವಿವರ\n\n<i>Dev: @ansafrozkhan</i>",
         "welcome_back": "👋 ಮತ್ತೆ ಬಂದೆ, <b>{name}</b>!\n\n📊 <b>ನಿನ್ನ Stats</b>\n🔍 ಹುಡುಕಾಟ: <b>{s}</b>\n✅ ಫಲಿತಾಂಶ: <b>{r}</b>\n\n🌍 <b>Global Stats</b>\n🔢 Searched: <b>{gs}</b>\n📦 Delivered: <b>{gr}</b>\n\n<i>Dev: @ansafrozkhan</i>",
         "stats": "📊 <b>Stats — {name}</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n🔍 ಹುಡುಕಾಟ: <b>{s}</b>\n✅ ಫಲಿತಾಂಶ: <b>{r}</b>\n\n🌍 <b>Global Stats</b>\n🔢 ಒಟ್ಟು: <b>{gs}</b>\n📦 ಒಟ್ಟು ಫಲಿತಾಂಶ: <b>{gr}</b>\n\n<i>Dev: @ansafrozkhan</i>",
-        "help": "ℹ️ <b>ಹೇಗೆ ಬಳಸಬೇಕು</b>\n\n📱 <b>ಮೊಬೈಲ್:</b> 10-ಅಂಕಿ (+91 ಬೇಡ)\n🪪 <b>ಆಧಾರ್:</b> 12-ಅಂಕಿ\n\n❌ Mixed input → ತಿರಸ್ಕೃತ\n⏱ 3s cooldown\n📋 Max <b>{lim}</b> searches/ಗಂಟೆ\n\n<i>Dev: @ansafrozkhan</i>",
+        "help": "ℹ️ <b>ಹೇಗೆ ಬಳಸಬೇಕು</b>\n\n📱 <b>ಮೊಬೈಲ್:</b> 10-ಅಂಕಿ\n🪪 <b>ಆಧಾರ್:</b> 12-ಅಂಕಿ\n\n❌ ಸಂಖ್ಯೆಗಳು ಮಾತ್ರ\n⏱ 3s cooldown\n📋 Max <b>{lim}</b> searches/ಗಂಟೆ\n\n<i>Dev: @ansafrozkhan</i>",
         "q1": "⚡ <b>ಹುಡುಕುತ್ತಿದ್ದೇನೆ...</b>\n🎯 <code>{q}</code>\n\n<i>Dev: @ansafrozkhan</i>",
         "qn": "📋 <b>Queue #{p}</b>  {bar}\n🎯 <code>{q}</code>\n⏳ ~{eta}s ಕಾಯಿ\n\n<i>Dev: @ansafrozkhan</i>",
         "no_result": "❌ <b>ಯಾವ ದಾಖಲೆಯೂ ಸಿಗಲಿಲ್ಲ</b>\n\n<code>{q}</code> — ಏನೂ ಇಲ್ಲ.\nಬೇರೆ ಹುಡುಕು.\n\n<i>Dev: @ansafrozkhan</i>",
@@ -164,9 +165,9 @@ T = {
     },
 }
 
-# ─── RESULT CARD FORMATTER (Beautiful Presentation) ───────────────────────────
+# ─── RESULT CARD FORMATTER (Exact UI Match) ────────────────────────────────────
 def format_card(chat_id, row, page, total, query):
-    # Extract from dictionary (10 columns, no source)
+    # row is now a dictionary from the API
     name = sv(row.get("name"))
     fname = sv(row.get("fathersName"))
     phone = sv(row.get("phoneNumber"))
@@ -178,7 +179,7 @@ def format_card(chat_id, row, page, total, query):
     state = sv(row.get("state"))
     town = sv(row.get("town"))
 
-    # Clean Alt Number: If it starts with 91 and is 12 digits, remove 91
+    # Clean Alt Number: Remove 91 if 12 digits
     if alt.startswith("91") and len(alt) == 12:
         alt = alt[2:]
 
@@ -199,7 +200,7 @@ def format_card(chat_id, row, page, total, query):
     if aadhar: lines.append(f"🪪 <b>{tx(chat_id, 'lbl_aadhar')}</b> ➡️ <code>{aadhar}</code>")
     
     if addr:
-        lines.append(f"\n🏠 <b>{tx(chat_id, 'lbl_address')}</b>")
+        lines.append(f"🏠 <b>{tx(chat_id, 'lbl_address')}</b>")
         lines.append(f"<blockquote>{html_lib.escape(addr)}</blockquote>")
         
     loc = [x for x in [town, dist, state] if x]
@@ -327,13 +328,17 @@ def err_kb(chat_id): return [[{"text": tx(chat_id, "b_help"), "callback_data": "
 def result_kb(chat_id, page, total):
     nav = []
     if page > 0: nav.append({"text": tx(chat_id, "b_prev"), "callback_data": f"pg:{page-1}"})
-    if total > 1: nav.append({"text": f"📄 {page+1}/{total}", "callback_data": "noop"})
+    
+    if total > 1:
+        nav.append({"text": f"📄 {page+1}/{total}", "callback_data": "noop"})
+        
     if page < total - 1: nav.append({"text": tx(chat_id, "b_next"), "callback_data": f"pg:{page+1}"})
     
     keyboard = []
     if nav: keyboard.append(nav)
     keyboard.append([{"text": tx(chat_id, "b_report"), "callback_data": f"html:{page}"}])
     keyboard.append([{"text": tx(chat_id, "b_search"), "callback_data": "new_search"},{"text": tx(chat_id, "b_stats"), "callback_data": "stats"}])
+    
     return keyboard
 
 def push_queue_updates():
@@ -346,7 +351,7 @@ def push_queue_updates():
             api_call("editMessageText", {"chat_id": cid, "message_id": mid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True})
         except Exception: pass
 
-# ─── WORKER (TALKS TO RENDER API) ─────────────────────────────────────────────
+# ─── WORKER (STEP 2 IMPLEMENTED) ──────────────────────────────────────────────
 def worker():
     while True:
         chat_id, query, msg_id = search_queue.get()
@@ -362,6 +367,7 @@ def worker():
             global_stats["searches"] += 1
             ud(chat_id)["searches"] += 1
 
+            # CHECK CACHE FIRST (0.01 seconds)
             if query in search_cache:
                 rows = search_cache[query]
                 search_cache.move_to_end(query)
@@ -375,6 +381,7 @@ def worker():
                     print(f"[API FETCH ERR] {api_e}")
                     rows = []
 
+                # Save to cache for next time
                 search_cache[query] = rows
                 if len(search_cache) > CACHE_SIZE:
                     search_cache.popitem(last=False)
@@ -399,7 +406,7 @@ def worker():
 
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
-def home(): return "KaramChand Bot is live."
+def home(): return "KaramChand v7 is live."
 
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
@@ -475,11 +482,9 @@ def webhook():
     u["hourly"] = [t for t in u["hourly"] if now - t < 3600]
     if len(u["hourly"]) >= HOURLY_LIMIT: send_msg(chat_id, tx(chat_id, "e_limit"), kb=err_kb(chat_id)); return "OK"
 
-    # 🚨 INPUT VALIDATION (Numbers only now)
     clean = raw
     if raw.isdigit():
         if len(raw) == 12 and raw.startswith("91"): clean = raw[2:]
-        # Only 10-digit mobile or 12-digit aadhar allowed
         if len(clean) not in (10, 12): 
             send_msg(chat_id, tx(chat_id, "e_digits", n=len(clean)), kb=err_kb(chat_id)); 
             return "OK"
@@ -502,7 +507,6 @@ def webhook():
 # ─── STARTUP ──────────────────────────────────────────────────────────────────
 threading.Thread(target=worker, daemon=True).start()
 
-# Render dynamically assigns a port
 port = int(os.environ.get("PORT", 5000))
 render_url = os.environ.get("RENDER_EXTERNAL_URL")
 
