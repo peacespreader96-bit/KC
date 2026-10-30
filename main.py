@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse
 # ═══════════════════════════════════════════════════════════════════════════════
 TOKEN       = os.getenv("BOT_TOKEN",   "8723126732:AAHVFOySgFaWN4_4InqtKrvkgN15crbPi0w")
 ADMIN_ID    = int(os.getenv("ADMIN_ID",    "5505679330"))
-HF_TOKEN    = os.getenv("HF_TOKEN",    "hf_YOUR_READ_TOKEN_HERE")
+HF_TOKEN    = os.getenv("HF_TOKEN",    "hf_YOUR_READ_TOKEN_HERE") # 🔴 PASTE YOUR HF TOKEN HERE
 BOT_LINK    = os.getenv("BOT_LINK",    "https://t.me/Karam_Chand_bot")
 DEV_LINK    = os.getenv("DEV_LINK",    "https://t.me/ansafrozkhan")
 DEV_HANDLE  = os.getenv("DEV_HANDLE",  "@ansafrozkhan")
@@ -39,7 +39,7 @@ BASE_URL    = f"https://api.telegram.org/bot{TOKEN}"
 
 MAX_QUEUE          = 15    # hard cap on concurrent queued searches
 SEARCH_COOLDOWN    = 600   # 10 min between searches per user
-MSG_COOLDOWN       = 3     # 3 s micro-cooldown (spam guard)
+MSG_COOLDOWN       = 1     # 1 s micro-cooldown (prevents accidental double-clicks)
 SESSION_TTL        = 1800  # 30 min — stale session RAM reclamation
 QUEUE_BROADCAST_IV = 5     # seconds between automatic position broadcasts
 GC_INTERVAL        = 300   # session GC runs every 5 min
@@ -62,7 +62,6 @@ class _RingHandler(logging.Handler):
         with self._lk:
             return list(self._buf)[-n:]
 
-
 _FMT  = "%(asctime)s [%(levelname)-5s] %(message)s"
 _ring = _RingHandler(400)
 _ring.setFormatter(logging.Formatter(_FMT, "%H:%M:%S"))
@@ -76,34 +75,29 @@ log = logging.getLogger("bot")
 app = FastAPI(title="KaramChand OSINT", docs_url=None, redoc_url=None)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DUCKDB
+#  DUCKDB (Single Connection with Lock & Timeout)
 # ═══════════════════════════════════════════════════════════════════════════════
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-def _make_db() -> duckdb.DuckDBPyConnection:
-    db = duckdb.connect(config={"custom_user_agent": _UA})
-    db.execute("SET memory_limit='200MB'; SET threads=1;")
-    db.execute("INSTALL httpfs; LOAD httpfs;")
-    if HF_TOKEN and HF_TOKEN != "hf_YOUR_READ_TOKEN_HERE":
-        db.execute(f"CREATE SECRET (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
-    
-    urls = [f"{BASE_HF}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS)]
-    url_list = "[" + ", ".join(f"'{u}'" for u in urls) + "]"
-    db.execute(f"CREATE VIEW people_phone AS SELECT * FROM read_parquet({url_list})")
-    return db
+log.info("⏳ Initialising DuckDB connection …")
+db = duckdb.connect(config={"custom_user_agent": _UA})
 
-log.info("⏳ Initialising DuckDB worker connection …")
-worker_db = _make_db()
-log.info("✅ Worker DB ready")
+# 🔴 SET http_timeout=10000 to prevent infinite freezes if HF is blocked
+db.execute("SET memory_limit='200MB'; SET threads=1; SET http_timeout=10000;")
+db.execute("INSTALL httpfs; LOAD httpfs;")
 
-log.info("⏳ Initialising DuckDB API connection …")
-api_db    = _make_db()
-_api_lock = threading.Lock()
-log.info("✅ API DB ready")
+if HF_TOKEN and HF_TOKEN != "hf_YOUR_READ_TOKEN_HERE":
+    db.execute(f"CREATE SECRET (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
 
+urls = [f"{BASE_HF}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS)]
+url_list = "[" + ", ".join(f"'{u}'" for u in urls) + "]"
+db.execute(f"CREATE VIEW people_phone AS SELECT * FROM read_parquet({url_list})")
+
+_db_lock = threading.Lock()
+log.info("✅ DuckDB ready")
 
 def _to_dicts(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     cols = [d[0] for d in conn.description]
@@ -112,14 +106,11 @@ def _to_dicts(conn: duckdb.DuckDBPyConnection) -> list[dict]:
         for row in conn.fetchall()
     ]
 
-
-def db_search(number: str, *, use_worker: bool) -> list[dict]:
+def db_search(number: str) -> list[dict]:
+    """Single DB connection protected by a lock for thread safety."""
     sql = "SELECT * FROM people_phone WHERE phoneNumber = ? LIMIT 5"
-    if use_worker:
-        conn = worker_db.execute(sql, [number])
-        return _to_dicts(conn)
-    with _api_lock:
-        conn = api_db.execute(sql, [number])
+    with _db_lock:
+        conn = db.execute(sql, [number])
         return _to_dicts(conn)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -131,7 +122,6 @@ user_data:     dict[int, dict] = {}
 user_sessions: dict[int, dict] = {}
 active_users:  set[int]        = set()
 global_stats:  dict[str, int]  = {"searches": 0, "results": 0}
-
 
 def _get_ud(cid: int, name: str | None = None, username: str | None = None) -> dict:
     if cid not in user_data:
@@ -149,7 +139,6 @@ def _get_ud(cid: int, name: str | None = None, username: str | None = None) -> d
         if username: user_data[cid]["username"] = username
     return user_data[cid]
 
-
 def get_ud(cid: int, name: str | None = None, username: str | None = None) -> dict:
     with _sl:
         return _get_ud(cid, name, username)
@@ -161,7 +150,6 @@ _ql           = threading.Lock()
 _search_q     = _queue_mod.Queue()
 _queue_order: list[dict] = []
 
-
 def _q_pos(cid: int) -> int:
     for i, item in enumerate(_queue_order):
         if item["chat_id"] == cid:
@@ -169,17 +157,13 @@ def _q_pos(cid: int) -> int:
     return 0
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TELEGRAM API
+#  TELEGRAM API (Direct requests to avoid thread deadlocks)
 # ═══════════════════════════════════════════════════════════════════════════════
-_sess = requests.Session()
-_sess.headers.update({"Content-Type": "application/json"})
-
-
 def tg(method: str, payload: dict, *, retries: int = 2) -> dict:
     url = f"{BASE_URL}/{method}"
     for attempt in range(retries + 1):
         try:
-            data = _sess.post(url, json=payload, timeout=10).json()
+            data = requests.post(url, json=payload, timeout=10).json()
             if not data.get("ok"):
                 desc = data.get("description", "")
                 if "message is not modified" not in desc:
@@ -192,7 +176,6 @@ def tg(method: str, payload: dict, *, retries: int = 2) -> dict:
             time.sleep(0.4 * (attempt + 1))
     return {}
 
-
 def send_msg(cid: int, text: str, kb=None) -> int | None:
     p: dict = {
         "chat_id": cid, "text": text,
@@ -201,7 +184,6 @@ def send_msg(cid: int, text: str, kb=None) -> int | None:
     if kb:
         p["reply_markup"] = {"inline_keyboard": kb}
     return tg("sendMessage", p).get("result", {}).get("message_id")
-
 
 def edit_msg(cid: int, mid: int | None, text: str, kb=None) -> None:
     if not mid:
@@ -214,7 +196,6 @@ def edit_msg(cid: int, mid: int | None, text: str, kb=None) -> None:
         p["reply_markup"] = {"inline_keyboard": kb}
     tg("editMessageText", p)
 
-
 def answer_cb(cb_id: str) -> None:
     tg("answerCallbackQuery", {"callback_query_id": cb_id})
 
@@ -225,14 +206,11 @@ IST = timezone(timedelta(hours=5, minutes=30))
 _e  = html_lib.escape                          
 _D  = f"<i>👨‍💻 Dev: {DEV_HANDLE}</i>"          
 
-
 def now_ist() -> datetime:
     return datetime.now(IST)
 
-
 def ts_str() -> str:
     return now_ist().strftime("%d-%m-%Y %H:%M:%S IST")
-
 
 def elapsed_label(secs: float) -> str:
     if secs < 0.5: return "⚡ Blazing fast (<0.5s)"
@@ -241,27 +219,22 @@ def elapsed_label(secs: float) -> str:
     if secs < 15:  return f"🔥 {secs:.1f}s"
     return f"⏱ {secs:.1f}s"
 
-
 def sv(v) -> str:
     s = str(v).strip() if v is not None else ""
     return "" if s.lower() == "nan" else s
 
-
 def q_bar(pos: int, cap: int = 8) -> str:
     filled = min(pos, cap)
     return "🟥" * filled + "⬜" * (cap - filled)
-
 
 def clean_addr(addr) -> str:
     if not addr:
         return ""
     return re.sub(r"\s+", " ", re.sub(r"!+", ", ", str(addr))).strip(", ")
 
-
 def fmt_td(secs: int) -> str:
     m, s = divmod(secs, 60)
     return f"{m}m {s}s" if m else f"{s}s"
-
 
 def cooldown_left(cid: int) -> int:
     with _sl:
@@ -278,13 +251,11 @@ def main_kb():
         [{"text": "ℹ️ Help",       "callback_data": "help"}],
     ]
 
-
 def back_kb():
     return [
         [{"text": "🔍 Search Again", "callback_data": "new_search"},
          {"text": "ℹ️ Help",         "callback_data": "help"}],
     ]
-
 
 def result_kb(page: int, total: int):
     nav = []
@@ -319,7 +290,6 @@ def msg_welcome_new(name: str, username: str) -> str:
         f"{_D}"
     )
 
-
 def msg_welcome_back(name: str, username: str, u: dict) -> str:
     un = f" (@{_e(username)})" if username else ""
     with _sl:
@@ -335,7 +305,6 @@ def msg_welcome_back(name: str, username: str, u: dict) -> str:
         f"📦 Delivered:  <b>{gs['results']}</b>\n\n"
         f"{_D}"
     )
-
 
 def msg_stats(name: str, username: str, u: dict) -> str:
     un  = f"@{_e(username)}" if username else "—"
@@ -357,7 +326,6 @@ def msg_stats(name: str, username: str, u: dict) -> str:
         f"{_D}"
     )
 
-
 def msg_help() -> str:
     return (
         f"ℹ️ <b>How to Use KaramChand</b>\n\n"
@@ -367,7 +335,6 @@ def msg_help() -> str:
         f"📋 Max <b>{MAX_QUEUE}</b> searches in queue at once.\n\n"
         f"{_D}"
     )
-
 
 def msg_queue(pos: int, query: str) -> str:
     if pos == 1:
@@ -385,14 +352,12 @@ def msg_queue(pos: int, query: str) -> str:
         f"{_D}"
     )
 
-
 def msg_searching(query: str) -> str:
     return (
         f"⚡ <b>Searching…</b>\n"
         f"🔎 <code>{query}</code>\n\n"
         f"{_D}"
     )
-
 
 def msg_no_result(query: str) -> str:
     return (
@@ -458,7 +423,6 @@ def _html_field(icon: str, label: str, val: str, mono: bool = False) -> str:
         f'<div class="value"{cls}>{_e(val)}</div>'
         f'</div></div>'
     )
-
 
 def generate_html(row: dict, query: str) -> str:
     name        = sv(row.get("name"))
@@ -555,13 +519,12 @@ body{{background:var(--bg);color:var(--txt);font-family:-apple-system,'Segoe UI'
 </div>
 </div></body></html>"""
 
-
 def send_html_doc(cid: int, row: dict, query: str) -> None:
     try:
         content  = generate_html(row, query).encode("utf-8")
         filename = f"KC_{sv(row.get('phoneNumber')) or 'report'}.html"
         caption  = f"📄 <b>HTML Report</b>\n🔎 <code>{query}</code>\n\n{_D}"
-        _sess.post(
+        requests.post(
             f"{BASE_URL}/sendDocument",
             data    = {"chat_id": cid, "caption": caption, "parse_mode": "HTML"},
             files   = {"document": (filename, io.BytesIO(content), "text/html")},
@@ -601,7 +564,7 @@ def worker() -> None:
 
             edit_msg(cid, mid, msg_searching(query))
 
-            rows    = db_search(query, use_worker=True)
+            rows    = db_search(query)
             elapsed = time.monotonic() - t0
 
             with _sl:
@@ -673,11 +636,10 @@ def _session_gc() -> None:
 def _is_admin(cid: int) -> bool:
     return cid == ADMIN_ID
 
-
 def _upload_file(cid: int, data: bytes, filename: str,
                  mime: str, caption: str) -> None:
     try:
-        _sess.post(
+        requests.post(
             f"{BASE_URL}/sendDocument",
             data  = {"chat_id": cid, "caption": caption, "parse_mode": "HTML"},
             files = {"document": (filename, io.BytesIO(data), mime)},
@@ -685,7 +647,6 @@ def _upload_file(cid: int, data: bytes, filename: str,
         )
     except Exception as exc:
         log.error("_upload_file: %s", exc)
-
 
 def admin_send_data(cid: int) -> None:
     with _sl:
@@ -706,7 +667,6 @@ def admin_send_data(cid: int) -> None:
         daemon=True,
     ).start()
 
-
 def admin_send_logs(cid: int) -> None:
     data = "\n".join(_ring.tail(150)).encode()
     threading.Thread(
@@ -715,7 +675,6 @@ def admin_send_logs(cid: int) -> None:
               f"📋 <b>Logs</b> (last 150 lines) · {ts_str()}"),
         daemon=True,
     ).start()
-
 
 def admin_send_queue(cid: int) -> None:
     with _ql:
@@ -929,7 +888,7 @@ def poll_telegram() -> None:
                 f"{BASE_URL}/getUpdates?timeout=30"
                 + (f"&offset={offset}" if offset else "")
             )
-            resp = _sess.get(url, timeout=35).json()
+            resp = requests.get(url, timeout=35).json()
 
             if not resp.get("ok"):
                 log.warning("getUpdates !ok: %s", resp.get("description"))
@@ -972,7 +931,6 @@ def health():
         "global_stats": gs,
     }
 
-
 @app.get("/search")
 def api_search(q: str = FQ(...)):
     q = q.strip()
@@ -982,7 +940,7 @@ def api_search(q: str = FQ(...)):
             content={"error": "Strictly 10 digits required."},
         )
     try:
-        rows = db_search(q, use_worker=False)
+        rows = db_search(q)
         return {"count": len(rows), "results": rows}
     except Exception as exc:
         log.error("/search API error for q=%s: %s", q, exc)
