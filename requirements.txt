@@ -2,3 +2,5 @@ fastapi==0.143.5
 uvicorn==0.54.0
 duckdb==2.0.0
 requests==2.34.2
+flask==3.0.3
+gunicorn==21.2.0
