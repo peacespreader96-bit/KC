@@ -22,6 +22,11 @@ try:
 except Exception as e:
     print(f"❌ Error creating view: {e}")
 
+# Helper function to convert DuckDB cursor to list of dictionaries (Replaces pandas)
+def fetch_dicts(cursor):
+    columns = [desc[0] for desc in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
 @app.get("/")
 def health():
     return {"status": "alive"}
@@ -33,28 +38,31 @@ def search(q: str = Query(...)):
         results = []
         
         if q.isdigit():
-            # Search by phone or aadhar
-            query = f"""
+            # Search by phone or aadhar (Using Parameterized Query for Security)
+            query = """
                 SELECT name, fathersName, phoneNumber, aadharNumber, otherNumber, address, district, pincode, state, town 
                 FROM people_phone 
-                WHERE phoneNumber = '{q}' OR aadharNumber = '{q}' 
+                WHERE phoneNumber = ? OR aadharNumber = ? 
                 LIMIT 5
             """
-            results = db.execute(query).df().to_dict('records')
+            cur = db.execute(query, [q, q])
         else:
-            # Search by name
-            query = f"""
+            # Search by name (Using Parameterized Query for Security)
+            query = """
                 SELECT name, fathersName, phoneNumber, aadharNumber, otherNumber, address, district, pincode, state, town 
                 FROM people_phone 
-                WHERE name ILIKE '%{q}%' 
+                WHERE name ILIKE ? 
                 LIMIT 5
             """
-            results = db.execute(query).df().to_dict('records')
+            cur = db.execute(query, [f"%{q}%"])
 
-        # Clean up NaN values for JSON serialization
+        results = fetch_dicts(cur)
+
+        # DuckDB natively returns None for NULL/NaN values, which FastAPI serializes perfectly.
+        # We only need to ensure empty strings or weird values are cleaned up.
         clean_results = []
         for row in results:
-            clean_row = {k: (None if str(v) == 'nan' else v) for k, v in row.items()}
+            clean_row = {k: (None if str(v).lower() == 'nan' else v) for k, v in row.items()}
             clean_results.append(clean_row)
 
         return {"query": q, "count": len(clean_results), "results": clean_results}
