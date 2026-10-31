@@ -381,187 +381,32 @@ def _bootstrap_sqlite() -> None:
 
 _bootstrap_sqlite()
 
-def _expire_premium(u: dict) -> bool:
-    until = float(u.get("premium_until") or 0)
-    if u.get("is_premium") and until <= time.time():
-        u["is_premium"] = False
-        return True
-    return False
-
-def _get_ud(cid: int, name: str | None = None, username: str | None = None) -> dict:
-    dirty = False
-    u = user_data.get(cid)
-    if u is None:
-        u = _load_user(cid)
-        if u is None:
-            u = _blank_user(cid, name, username)
-            user_data[cid] = u
-            _save_user(u)
-        else:
-            user_data[cid] = u
-    if name and name != u.get("name"):
-        u["name"] = name; dirty = True
-    if username and username != u.get("username"):
-        u["username"] = username; dirty = True
-    if cid == ADMIN_ID and u.get("role") != "SUPER_ADMIN":
-        u["role"] = "SUPER_ADMIN"; dirty = True
-    if _expire_premium(u):
-        dirty = True
-    if dirty:
-        _save_user(u)
-    return u
-
-def _persist_loop() -> None:
-    while True:
-        time.sleep(3)
-        if _sql is None:
-            continue
-        with _sl:
-            snap = [(int(u["id"]), int(u.get("searches") or 0)) for u in user_data.values()]
-        for cid, searches in snap:
-            try:
-                with _sql_lock:
-                    _sql.execute(
-                        "UPDATE users SET total_searches = ? WHERE chat_id = ? AND COALESCE(total_searches, 0) < ?",
-                        (searches, cid, searches),
-                    )
-                    _sql.commit()
-            except Exception:
-                log.exception("persist failed")
-
-def _remember(cid: int, query: str, found: int) -> None:
-    u = user_data.get(cid)
-    if not u:
-        return
-    hist = list(u.get("history") or [])
-    hist.append({"query": query, "at": ts_str(), "found": found})
-    u["history"] = hist[-20:]
-    try:
-        _save_user(u)
-    except Exception:
-        log.exception("history save failed")
-
-def _touch_streak(cid: int) -> bool:
-    today = _today()
-    granted = False
-    with _sl:
-        user = _get_ud(cid)
-        last = user.get("last_streak_date") or ""
-        if last == today:
-            return False
-        today_dt = datetime.strptime(today, "%Y-%m-%d").date()
-        last_dt = None
-        if last:
-            try:
-                last_dt = datetime.strptime(last, "%Y-%m-%d").date()
-            except ValueError:
-                last_dt = None
-        if last_dt is not None and (today_dt - last_dt).days == STREAK_INTERVAL:
-            user["streak_count"] = int(user.get("streak_count") or 0) + 1
-        else:
-            user["streak_count"] = 1
-        user["last_streak_date"] = today
-        if int(user.get("streak_count") or 0) >= STREAK_INTERVAL:
-            _add_bonus(cid, STREAK_BONUS)
-            user["streak_count"] = 0
-            granted = True
-        _save_user(user)
-    return granted
-
-def _utr_lock_until(cid: int) -> float:
-    try:
-        return float(_kv_get(f"utrlock:{cid}", "0") or 0)
-    except ValueError:
-        return 0.0
-
-def _utr_locked(cid: int) -> bool:
-    return _utr_lock_until(cid) > time.time()
-
-def _bump_utr_attempt(cid: int) -> int:
-    with _sl:
-        user = _get_ud(cid)
-        user["utr_attempts"] = int(user.get("utr_attempts") or 0) + 1
-        attempts = int(user["utr_attempts"])
-        _save_user(user)
-    if attempts > 3:
-        _kv_set(f"utrlock:{cid}", str(time.time() + 3600))
-    return attempts
-
-def _reset_utr_attempts(cid: int) -> None:
-    with _sl:
-        user = user_data.get(cid)
-        if user is None:
-            loaded = _load_user(cid)
-            if loaded is not None:
-                user_data[cid] = loaded
-                user = loaded
-        if user is not None:
-            user["utr_attempts"] = 0
-            _save_user(user)
-        elif _sql is not None:
-            with _sql_lock:
-                _sql.execute("UPDATE users SET utr_attempts = 0 WHERE chat_id = ?", (cid,))
-                _sql.commit()
-    _kv_set(f"utrlock:{cid}", "0")
-
-def _backup_files() -> list[str]:
-    if not os.path.isdir(_BACKUP_DIR):
-        return []
-    files = [os.path.join(_BACKUP_DIR, n) for n in os.listdir(_BACKUP_DIR) if n.endswith(".db")]
-    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return files
-
-def _backup_loop() -> None:
-    while True:
-        time.sleep(300)
+def _create_fresh_db() -> str | None:
+    """Wipes the existing DB (if any) and creates a brand new one."""
+    global _sql, MAINTENANCE
+    if _sql is not None:
         try:
-            if _sql is None or not os.path.isfile(_DB_PATH):
-                continue
-            os.makedirs(_BACKUP_DIR, exist_ok=True)
-            with _sql_lock:
-                _sql.execute("PRAGMA wal_checkpoint(PASSIVE);")
-                _sql.commit()
-            stamp = now_ist().strftime("%Y%m%d_%I%M%p")
-            dest = os.path.join(_BACKUP_DIR, f"users_{stamp}.db")
-            shutil.copy2(_DB_PATH, dest)
-            for old in _backup_files()[20:]:
-                try:
-                    os.remove(old)
-                except OSError:
-                    pass
-            log.info("local backup %s", os.path.basename(dest))
+            _sql.close()
         except Exception:
-            log.exception("auto-backup failed")
-
-def _expiry_loop() -> None:
-    while True:
-        time.sleep(600)
-        if _sql is None:
-            continue
-        now = time.time()
+            pass
+    if os.path.isfile(_DB_PATH):
         try:
-            with _sql_lock:
-                rows = _sql.execute(
-                    "SELECT chat_id, premium_until FROM users "
-                    "WHERE is_premium = 1 AND premium_until BETWEEN ? AND ? AND COALESCE(is_banned, 0) = 0",
-                    (now + 23 * 3600, now + 25 * 3600),
-                ).fetchall()
-        except Exception:
-            log.exception("expiry scan failed")
-            continue
-        for row in rows:
-            cid = int(row["chat_id"])
-            until = float(row["premium_until"])
-            key = f"expnote:{cid}:{int(until)}"
-            if _kv_get(key, ""):
-                continue
-            send_msg(
-                cid,
-                "Bhai yaad rakh, tera premium <b>" + _e(fmt_until(until))
-                + "</b> ke aas-paas khatam ho raha hai — lagbhag 24 ghante baaki hain. "
-                "Renew kar le, warna lookups ruk jayenge.",
-            )
-            _kv_set(key, "1")
+            os.remove(_DB_PATH)
+        except OSError as exc:
+            return f"Purani file delete nahi hui: {exc}. Host manually delete kar."
+            
+    try:
+        _sql = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        _sql.row_factory = sqlite3.Row
+        _init_sqlite()
+        _seed_settings()
+        MAINTENANCE = False
+        log.info("✅ Fresh SQLite DB created by admin request")
+        return None
+    except Exception as exc:
+        log.exception("Failed to create fresh DB")
+        MAINTENANCE = True
+        return f"Fresh DB banane mein error aaya: {exc}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  QUEUE STATE
@@ -2928,6 +2773,22 @@ def handle_cb(cb: dict) -> None:
         _settle_payment(data.split(":", 1)[1], data.startswith("ok:"), mid, actor=cid)
         return
 
+    if data.startswith("dbinit:"):
+        if cid != ADMIN_ID:
+            answer_cb(cb["id"], "Sirf super admin kar sakta hai.", alert=True)
+            return
+        answer_cb(cb["id"])
+        if data.endswith("yes"):
+            send_msg(cid, "⏳ Naya DB bana raha hoon...")
+            err = _create_fresh_db()
+            if err:
+                send_msg(cid, f"❌ {_e(err)}")
+            else:
+                send_msg(cid, "✅ Fresh users.db ban gaya! Maintenance OFF. Ab tu normal chalega.")
+        else:
+            send_msg(cid, "Theek hai, cancel.")
+        return
+
     answer_cb(cb["id"])
     with _sl:
         user = _get_ud(cid, name=name, username=username)
@@ -3122,6 +2983,7 @@ def _dispatch_cmd(cid: int, raw: str) -> None:
     if cmd == "/help":
         send_msg(cid, msg_help(), kb=dashboard_kb())
         return
+    
     if cid == ADMIN_ID:
         if cmd == "/logs":
             admin_send_logs(cid)
@@ -3167,9 +3029,18 @@ def _dispatch_cmd(cid: int, raw: str) -> None:
             flow[cid] = {"mode": "WAITING_FOR_DB", "ts": time.time()}
             send_msg(cid, "Bhai users.db file yahin document karke bhej. Text mat likh, file chipka.")
             return
+            
+        if cmd == "/initdb":
+            send_msg(cid, "⚠️ Bhai ye purana DB delete karke naya khali DB banayega. Tu sure hai?", 
+                     kb=[[{"text": "Haan, DB naya bana", "callback_data": "dbinit:yes"}, {"text": "Nahi, cancel", "callback_data": "dbinit:no"}]])
+            return
+            
         if cmd == "/dashboard":
+            if cid in _desk:
+                _desk[cid]["mid"] = None  # Force a fresh message
             _open_desk(cid, "home")
             return
+        
         if cmd == "/role":
             _cmd_role_audit(cid, raw)
             return
@@ -3179,9 +3050,13 @@ def _dispatch_cmd(cid: int, raw: str) -> None:
         if cmd == "/data":
             _cmd_data(cid)
             return
+            
     if cmd == "/dashboard" and _can_desk(cid):
+        if cid in _desk:
+            _desk[cid]["mid"] = None  # Force a fresh message
         _open_desk(cid, "home")
         return
+    
     if cmd == "/mywork":
         _cmd_mywork(cid)
         return
@@ -3223,18 +3098,20 @@ def handle_msg(msg: dict) -> None:
     state = flow.get(cid) or {}
     mode = state.get("mode")
 
+    # ---- FIXED BROADCAST TRAP HERE ----
     if cid == ADMIN_ID and mode == "WAITING_FOR_BROADCAST":
         if raw == "/cancel":
             _clear_flow(cid)
             send_msg(cid, "Broadcast cancel.")
             return
-        if raw.startswith("/"):
+        if not raw.startswith("/"):
+            audience = state.get("audience") or "all"
+            _clear_flow(cid)
+            send_msg(cid, "Bhej raha hoon.")
+            threading.Thread(target=_broadcast, args=(audience, raw), daemon=True).start()
             return
-        audience = state.get("audience") or "all"
-        _clear_flow(cid)
-        send_msg(cid, "Bhej raha hoon.")
-        threading.Thread(target=_broadcast, args=(audience, raw), daemon=True).start()
-        return
+        # If it starts with "/", it falls through to _dispatch_cmd below
+    # -----------------------------------
 
     if raw.startswith("/"):
         if cid != ADMIN_ID and _banned(user):
@@ -3399,7 +3276,7 @@ def _startup_health() -> None:
     reasons = []
     if _sql is None or not os.path.isfile(_DB_PATH):
         MAINTENANCE = True
-        reasons.append("users.db missing hai. Empty DB nahi banaya. /restore se file daal.")
+        reasons.append("users.db missing hai. /restore se file daal, ya /initdb se fresh start kar.")
     try:
         db_search("7417679558")
     except Exception as exc:
