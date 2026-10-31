@@ -49,7 +49,7 @@ SPIN_JACKPOT = 64
 SPIN_WINS = {64: "premium", 43: 5, 22: 3, 1: 1}
 STREAK_INTERVAL = 3
 STREAK_BONUS = 1
-WELCOME_IMAGE_URL = "https://i.ibb.co/your-image-link/banner.jpg" # 🔴 ADD YOUR BANNER IMAGE URL HERE
+WELCOME_IMAGE_URL = "https://raw.githubusercontent.com/peacespreader96-bit/KC/refs/heads/main/banner.jpg" # 🔴 ADD YOUR BANNER IMAGE URL HERE
 
 PLANS: dict[str, dict] = {
     "day":   {"id": "day",   "name": "1 Din ka Pass",   "days": 1,  "amount": 29},
