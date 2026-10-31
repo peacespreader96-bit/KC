@@ -408,6 +408,188 @@ def _create_fresh_db() -> str | None:
         MAINTENANCE = True
         return f"Fresh DB banane mein error aaya: {exc}"
 
+def _expire_premium(u: dict) -> bool:
+    until = float(u.get("premium_until") or 0)
+    if u.get("is_premium") and until <= time.time():
+        u["is_premium"] = False
+        return True
+    return False
+
+def _get_ud(cid: int, name: str | None = None, username: str | None = None) -> dict:
+    dirty = False
+    u = user_data.get(cid)
+    if u is None:
+        u = _load_user(cid)
+        if u is None:
+            u = _blank_user(cid, name, username)
+            user_data[cid] = u
+            _save_user(u)
+        else:
+            user_data[cid] = u
+    if name and name != u.get("name"):
+        u["name"] = name; dirty = True
+    if username and username != u.get("username"):
+        u["username"] = username; dirty = True
+    if cid == ADMIN_ID and u.get("role") != "SUPER_ADMIN":
+        u["role"] = "SUPER_ADMIN"; dirty = True
+    if _expire_premium(u):
+        dirty = True
+    if dirty:
+        _save_user(u)
+    return u
+
+def _persist_loop() -> None:
+    while True:
+        time.sleep(3)
+        if _sql is None:
+            continue
+        with _sl:
+            snap = [(int(u["id"]), int(u.get("searches") or 0)) for u in user_data.values()]
+        for cid, searches in snap:
+            try:
+                with _sql_lock:
+                    _sql.execute(
+                        "UPDATE users SET total_searches = ? WHERE chat_id = ? AND COALESCE(total_searches, 0) < ?",
+                        (searches, cid, searches),
+                    )
+                    _sql.commit()
+            except Exception:
+                log.exception("persist failed")
+
+def _remember(cid: int, query: str, found: int) -> None:
+    u = user_data.get(cid)
+    if not u:
+        return
+    hist = list(u.get("history") or [])
+    hist.append({"query": query, "at": ts_str(), "found": found})
+    u["history"] = hist[-20:]
+    try:
+        _save_user(u)
+    except Exception:
+        log.exception("history save failed")
+
+def _touch_streak(cid: int) -> bool:
+    today = _today()
+    granted = False
+    with _sl:
+        user = _get_ud(cid)
+        last = user.get("last_streak_date") or ""
+        if last == today:
+            return False
+        today_dt = datetime.strptime(today, "%Y-%m-%d").date()
+        last_dt = None
+        if last:
+            try:
+                last_dt = datetime.strptime(last, "%Y-%m-%d").date()
+            except ValueError:
+                last_dt = None
+        if last_dt is not None and (today_dt - last_dt).days == STREAK_INTERVAL:
+            user["streak_count"] = int(user.get("streak_count") or 0) + 1
+        else:
+            user["streak_count"] = 1
+        user["last_streak_date"] = today
+        if int(user.get("streak_count") or 0) >= STREAK_INTERVAL:
+            _add_bonus(cid, STREAK_BONUS)
+            user["streak_count"] = 0
+            granted = True
+        _save_user(user)
+    return granted
+
+def _utr_lock_until(cid: int) -> float:
+    try:
+        return float(_kv_get(f"utrlock:{cid}", "0") or 0)
+    except ValueError:
+        return 0.0
+
+def _utr_locked(cid: int) -> bool:
+    return _utr_lock_until(cid) > time.time()
+
+def _bump_utr_attempt(cid: int) -> int:
+    with _sl:
+        user = _get_ud(cid)
+        user["utr_attempts"] = int(user.get("utr_attempts") or 0) + 1
+        attempts = int(user["utr_attempts"])
+        _save_user(user)
+    if attempts > 3:
+        _kv_set(f"utrlock:{cid}", str(time.time() + 3600))
+    return attempts
+
+def _reset_utr_attempts(cid: int) -> None:
+    with _sl:
+        user = user_data.get(cid)
+        if user is None:
+            loaded = _load_user(cid)
+            if loaded is not None:
+                user_data[cid] = loaded
+                user = loaded
+        if user is not None:
+            user["utr_attempts"] = 0
+            _save_user(user)
+        elif _sql is not None:
+            with _sql_lock:
+                _sql.execute("UPDATE users SET utr_attempts = 0 WHERE chat_id = ?", (cid,))
+                _sql.commit()
+    _kv_set(f"utrlock:{cid}", "0")
+
+def _backup_files() -> list[str]:
+    if not os.path.isdir(_BACKUP_DIR):
+        return []
+    files = [os.path.join(_BACKUP_DIR, n) for n in os.listdir(_BACKUP_DIR) if n.endswith(".db")]
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files
+
+def _backup_loop() -> None:
+    while True:
+        time.sleep(300)
+        try:
+            if _sql is None or not os.path.isfile(_DB_PATH):
+                continue
+            os.makedirs(_BACKUP_DIR, exist_ok=True)
+            with _sql_lock:
+                _sql.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                _sql.commit()
+            stamp = now_ist().strftime("%Y%m%d_%I%M%p")
+            dest = os.path.join(_BACKUP_DIR, f"users_{stamp}.db")
+            shutil.copy2(_DB_PATH, dest)
+            for old in _backup_files()[20:]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            log.info("local backup %s", os.path.basename(dest))
+        except Exception:
+            log.exception("auto-backup failed")
+
+def _expiry_loop() -> None:
+    while True:
+        time.sleep(600)
+        if _sql is None:
+            continue
+        now = time.time()
+        try:
+            with _sql_lock:
+                rows = _sql.execute(
+                    "SELECT chat_id, premium_until FROM users "
+                    "WHERE is_premium = 1 AND premium_until BETWEEN ? AND ? AND COALESCE(is_banned, 0) = 0",
+                    (now + 23 * 3600, now + 25 * 3600),
+                ).fetchall()
+        except Exception:
+            log.exception("expiry scan failed")
+            continue
+        for row in rows:
+            cid = int(row["chat_id"])
+            until = float(row["premium_until"])
+            key = f"expnote:{cid}:{int(until)}"
+            if _kv_get(key, ""):
+                continue
+            send_msg(
+                cid,
+                "Bhai yaad rakh, tera premium <b>" + _e(fmt_until(until))
+                + "</b> ke aas-paas khatam ho raha hai — lagbhag 24 ghante baaki hain. "
+                "Renew kar le, warna lookups ruk jayenge.",
+            )
+            _kv_set(key, "1")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  QUEUE STATE
 # ═══════════════════════════════════════════════════════════════════════════════
