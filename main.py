@@ -4,10 +4,12 @@ KaramChand OSINT Telegram Bot · Production Edition
 FastAPI + DuckDB (httpfs/HuggingFace) + Long Polling + SQLite members
 """
 
+import csv
 import io
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import threading
@@ -30,26 +32,29 @@ from fastapi.responses import JSONResponse
 # ═══════════════════════════════════════════════════════════════════════════════
 TOKEN       = os.getenv("BOT_TOKEN",   "8723126732:AAHVFOySgFaWN4_4InqtKrvkgN15crbPi0w")
 ADMIN_ID    = int(os.getenv("ADMIN_ID",    "5505679330"))
-HF_TOKEN    = os.getenv("HF_TOKEN",    "hf_YOUR_READ_TOKEN_HERE") # 🔴 PASTE YOUR HF TOKEN HERE
+HF_TOKEN    = os.getenv("HF_TOKEN",    "hf_YOUR_READ_TOKEN_HERE") # 🔴 PASTE YOUR HF READ TOKEN HERE
 BOT_LINK    = os.getenv("BOT_LINK",    "https://t.me/Karam_Chand_bot")
 DEV_LINK    = os.getenv("DEV_LINK",    "https://t.me/ansafrozkhan")
 DEV_HANDLE  = os.getenv("DEV_HANDLE",  "@ansafrozkhan")
 BOT_NAME    = os.getenv("BOT_NAME",    "KaramChand")
-UPI_ID      = os.getenv("UPI_ID",      "admin@upi") # 🔴 CHANGE TO YOUR UPI ID
+UPI_ID      = os.getenv("UPI_ID",      "admin@upi") # 🔴 CHANGE TO YOUR REAL UPI ID
 BASE_HF     = "hf://buckets/CutehackX/icrm-hitek-full-db-mixed-bucket/"
 BASE_URL    = f"https://api.telegram.org/bot{TOKEN}"
 
-FORCE_CHANNELS: list[str] = []  # Example: ["@Channel1", "@Channel2"]
+FORCE_CHANNELS: list[str] = []  # Example: ["@YourChannel"] - Leave empty [] to skip force join
 FREE_DAILY_LIMIT = 3
-SPIN_INTERVAL = "daily"  # daily | alternate | weekly
+SPIN_INTERVAL = "daily"
 SPIN_WINNER_LIMIT = 5
 SPIN_JACKPOT = 64
 SPIN_WINS = {64: "premium", 43: 5, 22: 3, 1: 1}
+STREAK_INTERVAL = 3
+STREAK_BONUS = 1
+WELCOME_IMAGE_URL = "https://i.ibb.co/your-image-link/banner.jpg" # 🔴 ADD YOUR BANNER IMAGE URL HERE
 
 PLANS: dict[str, dict] = {
-    "day":   {"id": "day",   "name": "1 Day Pass",   "days": 1,  "amount": 29},
-    "week":  {"id": "week",  "name": "7 Days Pass",  "days": 7,  "amount": 79},
-    "month": {"id": "month", "name": "30 Days Pass", "days": 30, "amount": 150},
+    "day":   {"id": "day",   "name": "1 Din ka Pass",   "days": 1,  "amount": 29},
+    "week":  {"id": "week",  "name": "7 Din ka Pass",   "days": 7,  "amount": 79},
+    "month": {"id": "month", "name": "30 Din ka Pass",  "days": 30, "amount": 150},
 }
 
 SUPPORTED_LANGS = ["en"]
@@ -64,6 +69,7 @@ PARQUET_PARTS      = 7
 _STAGE_GAP         = 0.45
 
 _DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.db")
+_BAN_TEXT = "Bhai tera ID ban hai. Koi feature nahi chalega — desk band. Operator se baat kar, yahan rona band."
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LOGGING
@@ -89,7 +95,7 @@ logging.basicConfig(level=logging.INFO, format=_FMT, datefmt="%H:%M:%S")
 logging.getLogger().addHandler(_ring)
 log = logging.getLogger("bot")
 
-app = FastAPI(title="KaramChand OSINT", docs_url=None, redoc_url=None)
+app = FastAPI(title="KaramChand", docs_url=None, redoc_url=None)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DUCKDB
@@ -165,7 +171,11 @@ def _init_sqlite() -> None:
                 referral_count   INTEGER DEFAULT 0,
                 referred_by      INTEGER,
                 last_spin_date   TEXT,
-                history          TEXT
+                history          TEXT,
+                last_streak_date TEXT,
+                streak_count     INTEGER DEFAULT 0,
+                utr_attempts     INTEGER DEFAULT 0,
+                is_banned        INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS payments (
                 id         TEXT PRIMARY KEY,
@@ -185,6 +195,15 @@ def _init_sqlite() -> None:
             );
             """
         )
+        existing = {row[1] for row in _sql.execute("PRAGMA table_info(users)").fetchall()}
+        for col, ddl in (
+            ("last_streak_date", "ALTER TABLE users ADD COLUMN last_streak_date TEXT"),
+            ("streak_count", "ALTER TABLE users ADD COLUMN streak_count INTEGER DEFAULT 0"),
+            ("utr_attempts", "ALTER TABLE users ADD COLUMN utr_attempts INTEGER DEFAULT 0"),
+            ("is_banned", "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0"),
+        ):
+            if col not in existing:
+                _sql.execute(ddl)
         _sql.commit()
 
 _init_sqlite()
@@ -192,22 +211,26 @@ log.info("✅ SQLite ready · %s", _DB_PATH)
 
 def _blank_user(cid: int, name: str | None, username: str | None) -> dict:
     return {
-        "id":              cid,
-        "name":            name or "User",
-        "username":        username or "",
-        "searches":        0,
-        "results":         0,
-        "last_search":     0.0,
-        "last_msg":        0.0,
-        "lang":            "en",
-        "is_premium":      False,
-        "premium_until":   0.0,
-        "history":         [],
-        "daily_searches":  0,
+        "id":               cid,
+        "name":             name or "User",
+        "username":         username or "",
+        "searches":         0,
+        "results":          0,
+        "last_search":      0.0,
+        "last_msg":         0.0,
+        "lang":             "en",
+        "is_premium":       False,
+        "premium_until":    0.0,
+        "history":          [],
+        "daily_searches":   0,
         "last_search_date": "",
-        "referral_count":  0,
-        "referred_by":     None,
-        "last_spin_date":  "",
+        "referral_count":   0,
+        "referred_by":      None,
+        "last_spin_date":   "",
+        "last_streak_date": "",
+        "streak_count":     0,
+        "utr_attempts":     0,
+        "is_banned":        0,
     }
 
 def _from_row(row: sqlite3.Row) -> dict:
@@ -219,22 +242,26 @@ def _from_row(row: sqlite3.Row) -> dict:
         history = []
     referred = row["referred_by"]
     return {
-        "id":              int(row["chat_id"]),
-        "name":            row["name"] or "User",
-        "username":        row["username"] or "",
-        "searches":        int(row["total_searches"] or 0),
-        "results":         0,
-        "last_search":     0.0,
-        "last_msg":        0.0,
-        "lang":            "en",
-        "is_premium":      bool(row["is_premium"]),
-        "premium_until":   float(row["premium_until"] or 0),
-        "history":         history,
-        "daily_searches":  int(row["daily_searches"] or 0),
+        "id":               int(row["chat_id"]),
+        "name":             row["name"] or "User",
+        "username":         row["username"] or "",
+        "searches":         int(row["total_searches"] or 0),
+        "results":          0,
+        "last_search":      0.0,
+        "last_msg":         0.0,
+        "lang":             "en",
+        "is_premium":       bool(row["is_premium"]),
+        "premium_until":    float(row["premium_until"] or 0),
+        "history":          history,
+        "daily_searches":   int(row["daily_searches"] or 0),
         "last_search_date": row["last_search_date"] or "",
-        "referral_count":  int(row["referral_count"] or 0),
-        "referred_by":     int(referred) if referred not in (None, "") else None,
-        "last_spin_date":  row["last_spin_date"] or "",
+        "referral_count":   int(row["referral_count"] or 0),
+        "referred_by":      int(referred) if referred not in (None, "") else None,
+        "last_spin_date":   row["last_spin_date"] or "",
+        "last_streak_date": row["last_streak_date"] or "",
+        "streak_count":     int(row["streak_count"] or 0),
+        "utr_attempts":     int(row["utr_attempts"] or 0),
+        "is_banned":        int(row["is_banned"] or 0),
     }
 
 def _save_user(u: dict) -> None:
@@ -246,8 +273,9 @@ def _save_user(u: dict) -> None:
             INSERT INTO users (
                 chat_id, name, username, is_premium, premium_until, total_searches,
                 daily_searches, last_search_date, referral_count, referred_by,
-                last_spin_date, history
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_spin_date, history, last_streak_date, streak_count,
+                utr_attempts, is_banned
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 name=excluded.name,
                 username=excluded.username,
@@ -259,7 +287,11 @@ def _save_user(u: dict) -> None:
                 referral_count=excluded.referral_count,
                 referred_by=excluded.referred_by,
                 last_spin_date=excluded.last_spin_date,
-                history=excluded.history
+                history=excluded.history,
+                last_streak_date=excluded.last_streak_date,
+                streak_count=excluded.streak_count,
+                utr_attempts=excluded.utr_attempts,
+                is_banned=excluded.is_banned
             """,
             (
                 int(u["id"]),
@@ -274,6 +306,10 @@ def _save_user(u: dict) -> None:
                 int(referred) if referred else None,
                 u.get("last_spin_date") or "",
                 history,
+                u.get("last_streak_date") or "",
+                int(u.get("streak_count") or 0),
+                int(u.get("utr_attempts") or 0),
+                int(u.get("is_banned") or 0),
             ),
         )
         _sql.commit()
@@ -353,6 +389,88 @@ def _remember(cid: int, query: str, found: int) -> None:
     except Exception:
         log.exception("history save failed")
 
+def _touch_streak(cid: int) -> bool:
+    """Count a search toward the streak. Bonus when the gap is exactly STREAK_INTERVAL days."""
+    today = _today()
+    granted = False
+    with _sl:
+        user = _get_ud(cid)
+        last = user.get("last_streak_date") or ""
+        if last == today:
+            return False
+        today_dt = datetime.strptime(today, "%Y-%m-%d").date()
+        last_dt = None
+        if last:
+            try:
+                last_dt = datetime.strptime(last, "%Y-%m-%d").date()
+            except ValueError:
+                last_dt = None
+        if last_dt is not None and (today_dt - last_dt).days == STREAK_INTERVAL:
+            user["streak_count"] = int(user.get("streak_count") or 0) + 1
+        else:
+            user["streak_count"] = 1
+        user["last_streak_date"] = today
+        if int(user.get("streak_count") or 0) >= STREAK_INTERVAL:
+            _add_bonus(cid, STREAK_BONUS)
+            user["streak_count"] = 0
+            granted = True
+        _save_user(user)
+    return granted
+
+def _utr_lock_until(cid: int) -> float:
+    try:
+        return float(_kv_get(f"utrlock:{cid}", "0") or 0)
+    except ValueError:
+        return 0.0
+
+def _utr_locked(cid: int) -> bool:
+    return _utr_lock_until(cid) > time.time()
+
+def _bump_utr_attempt(cid: int) -> int:
+    with _sl:
+        user = _get_ud(cid)
+        user["utr_attempts"] = int(user.get("utr_attempts") or 0) + 1
+        attempts = int(user["utr_attempts"])
+        _save_user(user)
+    if attempts > 3:
+        _kv_set(f"utrlock:{cid}", str(time.time() + 3600))
+    return attempts
+
+def _reset_utr_attempts(cid: int) -> None:
+    with _sl:
+        user = user_data.get(cid)
+        if user is None:
+            loaded = _load_user(cid)
+            if loaded is not None:
+                user_data[cid] = loaded
+                user = loaded
+        if user is not None:
+            user["utr_attempts"] = 0
+            _save_user(user)
+        else:
+            with _sql_lock:
+                _sql.execute("UPDATE users SET utr_attempts = 0 WHERE chat_id = ?", (cid,))
+                _sql.commit()
+    _kv_set(f"utrlock:{cid}", "0")
+
+def _backup_loop() -> None:
+    while True:
+        time.sleep(300)
+        try:
+            with _sql_lock:
+                _sql.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                _sql.commit()
+            with open(_DB_PATH, "rb") as fh:
+                blob = fh.read()
+            requests.post(
+                f"{BASE_URL}/sendDocument",
+                data={"chat_id": str(ADMIN_ID), "caption": "🔄 Auto-Backup: users.db"},
+                files={"document": ("users.db", io.BytesIO(blob), "application/x-sqlite3")},
+                timeout=60,
+            )
+        except Exception:
+            log.exception("auto-backup failed")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  QUEUE STATE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -394,6 +512,17 @@ def send_msg(cid: int, text: str, kb=None) -> int | None:
     if kb: p["reply_markup"] = {"inline_keyboard": kb}
     return tg("sendMessage", p).get("result", {}).get("message_id")
 
+def send_photo(cid: int, photo: str, caption: str, kb=None) -> int | None:
+    p: dict = {
+        "chat_id": cid,
+        "photo": photo,
+        "caption": caption[:1024],
+        "parse_mode": "HTML",
+    }
+    if kb:
+        p["reply_markup"] = {"inline_keyboard": kb}
+    return tg("sendPhoto", p).get("result", {}).get("message_id")
+
 def edit_msg(cid: int, mid: int | None, text: str, kb=None) -> None:
     if not mid: return
     p: dict = {
@@ -402,6 +531,37 @@ def edit_msg(cid: int, mid: int | None, text: str, kb=None) -> None:
     }
     if kb: p["reply_markup"] = {"inline_keyboard": kb}
     tg("editMessageText", p)
+
+def desk_edit(cid: int, mid: int | None, text: str, kb=None) -> None:
+    """Edit a text message, or the welcome photo caption, without touching queue mids."""
+    if not mid:
+        send_msg(cid, text, kb=kb)
+        return
+    p: dict = {
+        "chat_id": cid, "message_id": mid, "text": text,
+        "parse_mode": "HTML", "disable_web_page_preview": True,
+    }
+    if kb:
+        p["reply_markup"] = {"inline_keyboard": kb}
+    res = tg("editMessageText", p)
+    desc = str(res.get("description") or "")
+    if res.get("ok") or "message is not modified" in desc:
+        return
+    cap: dict = {
+        "chat_id": cid, "message_id": mid, "caption": text[:1024], "parse_mode": "HTML",
+    }
+    if kb:
+        cap["reply_markup"] = {"inline_keyboard": kb}
+    res2 = tg("editMessageCaption", cap)
+    desc2 = str(res2.get("description") or "")
+    if res2.get("ok") or "message is not modified" in desc2:
+        return
+    if len(text) <= 1024:
+        tg("deleteMessage", {"chat_id": cid, "message_id": mid})
+        send_msg(cid, text, kb=kb)
+        return
+    tg("deleteMessage", {"chat_id": cid, "message_id": mid})
+    send_msg(cid, text, kb=kb)
 
 def answer_cb(cb_id: str, text: str | None = None, alert: bool = False) -> None:
     p: dict = {"callback_query_id": cb_id}
@@ -438,9 +598,9 @@ def fmt_until(ts: float) -> str:
     return datetime.fromtimestamp(ts, IST).strftime("%d %b %Y, %H:%M IST")
 
 def elapsed_label(secs: float) -> str:
-    if secs < 0.5: return "⚡ Blazing fast (<0.5s)"
-    if secs < 1.5: return "🚀 Lightning (~1s)"
-    if secs < 5:   return f"⚡ Fast ({secs:.1f}s)"
+    if secs < 0.5: return "⚡ Bijli se tez (<0.5s)"
+    if secs < 1.5: return "🚀 Rocket speed (~1s)"
+    if secs < 5:   return f"⚡ Tez tha ({secs:.1f}s)"
     if secs < 15:  return f"🔥 {secs:.1f}s"
     return f"⏱ {secs:.1f}s"
 
@@ -449,7 +609,6 @@ def sv(v) -> str:
     return "" if s.lower() == "nan" else s
 
 def q_bar(pos: int, cap: int = 10) -> str:
-    """Neon queue bar. Position 1 is full. Position 6 of a 10-step scale is half."""
     pct = 100 if pos <= 1 else max(10, 100 - (pos - 1) * (100 // cap))
     filled = int(round(cap * pct / 100))
     filled = max(0, min(cap, filled))
@@ -464,27 +623,21 @@ def fmt_td(secs: int) -> str:
     d, rem = divmod(secs, 86400)
     h, rem = divmod(rem, 3600)
     m, s = divmod(rem, 60)
-    if d:
-        return f"{d}d {h}h"
-    if h:
-        return f"{h}h {m}m"
-    if m:
-        return f"{m}m {s}s"
+    if d: return f"{d}d {h}h"
+    if h: return f"{h}h {m}m"
+    if m: return f"{m}m {s}s"
     return f"{s}s"
 
 def _today() -> str:
     return now_ist().strftime("%Y-%m-%d")
 
 def _daily_used(u: dict) -> int:
-    if u.get("last_search_date") != _today():
-        return 0
+    if u.get("last_search_date") != _today(): return 0
     return int(u.get("daily_searches") or 0)
 
 def _bonus_today(cid: int) -> int:
-    try:
-        return int(_kv_get(f"bonus:{cid}:{_today()}", "0") or "0")
-    except ValueError:
-        return 0
+    try: return int(_kv_get(f"bonus:{cid}:{_today()}", "0") or "0")
+    except ValueError: return 0
 
 def _add_bonus(cid: int, n: int) -> int:
     key = f"bonus:{cid}:{_today()}"
@@ -493,15 +646,13 @@ def _add_bonus(cid: int, n: int) -> int:
     return total
 
 def _premium_active(u: dict) -> bool:
-    if _expire_premium(u):
-        _save_user(u)
+    if _expire_premium(u): _save_user(u)
     return bool(u.get("is_premium")) and float(u.get("premium_until") or 0) > time.time()
 
 def _extend_premium(u: dict, days: int) -> float:
     now = time.time()
     base = float(u.get("premium_until") or 0)
-    if not (u.get("is_premium") and base > now):
-        base = now
+    if not (u.get("is_premium") and base > now): base = now
     u["is_premium"] = True
     u["premium_until"] = base + days * 86400
     return float(u["premium_until"])
@@ -535,20 +686,15 @@ def _countdown() -> str:
     return fmt_td(max(secs, 0))
 
 def _jackpots_left() -> int:
-    try:
-        used = int(_kv_get(f"spinwin:{_window_id()}", "0") or "0")
-    except ValueError:
-        used = 0
+    try: used = int(_kv_get(f"spinwin:{_window_id()}", "0") or "0")
+    except ValueError: used = 0
     return max(0, SPIN_WINNER_LIMIT - used)
 
 def _take_jackpot() -> bool:
     key = f"spinwin:{_window_id()}"
-    try:
-        used = int(_kv_get(key, "0") or "0")
-    except ValueError:
-        used = 0
-    if used >= SPIN_WINNER_LIMIT:
-        return False
+    try: used = int(_kv_get(key, "0") or "0")
+    except ValueError: used = 0
+    if used >= SPIN_WINNER_LIMIT: return False
     _kv_set(key, str(used + 1))
     return True
 
@@ -559,24 +705,25 @@ def _member_of(cid: int, channel: str) -> bool:
     data = tg("getChatMember", {"chat_id": channel, "user_id": cid})
     result = data.get("result") or {}
     status = result.get("status", "")
-    if status in ("creator", "administrator", "member"):
-        return True
+    if status in ("creator", "administrator", "member"): return True
     return status == "restricted" and bool(result.get("is_member"))
 
 def _needs_join(cid: int) -> bool:
-    if cid == ADMIN_ID or not FORCE_CHANNELS:
-        return False
+    if cid == ADMIN_ID or not FORCE_CHANNELS: return False
     return any(not _member_of(cid, ch) for ch in FORCE_CHANNELS)
+
+def _banned(u: dict | None) -> bool:
+    return bool(u) and int(u.get("is_banned") or 0) == 1
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UI DICTIONARY & KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════════
 T = {
     "en": {
-        "welcome": "This is your private lookup desk.",
-        "search_prompt": "Send a 10-digit mobile number. Nothing else is needed.",
-        "not_found": "No records found.",
-        "invalid": "Send a 10-digit mobile number — digits only, no spaces.",
+        "welcome": "Kya scene hai bhai? Bata kis customer ki info chahiye.",
+        "search_prompt": "Bhai 10 digit ka customer phone number daal. Baaki bakwaas nahi chahiye.",
+        "not_found": "Kuch nahi mila bhai.",
+        "invalid": "Bhai 10 digit ka customer phone number daal, dimag mat kha.",
     }
 }
 
@@ -586,157 +733,134 @@ def get_text(cid: int, key: str) -> str:
 
 def dashboard_kb():
     return [
-        [{"text": "👤 My Profile", "callback_data": "profile"},
+        [{"text": "👤 Mera Scene", "callback_data": "profile"},
          {"text": "👑 Premium", "callback_data": "premium"}],
-        [{"text": "📜 History", "callback_data": "history"},
+        [{"text": "📜 Purani Search", "callback_data": "history"},
          {"text": "🆘 Support", "callback_data": "support"}],
-        [{"text": "🔍 Start Search", "callback_data": "search"}],
+        [{"text": "🔍 Number Daal", "callback_data": "search"}],
     ]
 
-def main_kb():
-    return dashboard_kb()
-
-def back_kb():
-    return [[{"text": "Back", "callback_data": "dashboard"}]]
+def main_kb(): return dashboard_kb()
+def back_kb(): return [[{"text": "Wapas", "callback_data": "dashboard"}]]
 
 def pricing_kb():
     rows = [
         [{"text": f"{p['name']} · ₹{p['amount']}", "callback_data": f"plan:{pid}"}]
         for pid, p in PLANS.items()
     ]
-    rows.append([{"text": "Back", "callback_data": "dashboard"}])
+    rows.append([{"text": "Wapas", "callback_data": "dashboard"}])
     return rows
 
 def result_kb(page: int, total: int):
     nav = []
-    if page > 0: nav.append({"text": "◀️ Prev", "callback_data": f"pg:{page - 1}"})
+    if page > 0: nav.append({"text": "◀️ Pichla", "callback_data": f"pg:{page - 1}"})
     if total > 1: nav.append({"text": f"📄 {page + 1}/{total}", "callback_data": "noop"})
-    if page < total - 1: nav.append({"text": "Next ▶️", "callback_data": f"pg:{page + 1}"})
+    if page < total - 1: nav.append({"text": "Agla ▶️", "callback_data": f"pg:{page + 1}"})
     rows = [nav] if nav else []
     rows.append([{"text": "📄 HTML Report", "callback_data": f"html:{page}"}])
-    rows.append([{"text": "Back", "callback_data": "dashboard"}])
+    rows.append([{"text": "Wapas", "callback_data": "dashboard"}])
     return rows
 
 def force_kb():
     rows = []
     for ch in FORCE_CHANNELS:
         handle = ch[1:] if str(ch).startswith("@") else None
-        if handle:
-            rows.append([{"text": f"Join {ch}", "url": f"https://t.me/{handle}"}])
-        else:
-            rows.append([{"text": f"Join {ch}", "callback_data": "noop"}])
-    rows.append([{"text": "Verify ✅", "callback_data": "verify"}])
+        if handle: rows.append([{"text": f"Join kar {ch}", "url": f"https://t.me/{handle}"}])
+        else: rows.append([{"text": f"Join kar {ch}", "callback_data": "noop"}])
+    rows.append([{"text": "Check kar ✅", "callback_data": "verify"}])
     return rows
 
 def broadcast_kb():
-    return [[
-        {"text": "All Users", "callback_data": "cast:all"},
-        {"text": "Premium Only", "callback_data": "cast:prem"},
-    ]]
+    return [[{"text": "Sabko", "callback_data": "cast:all"}, {"text": "Sirf Premium", "callback_data": "cast:prem"}]]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MESSAGE TEMPLATES
 # ═══════════════════════════════════════════════════════════════════════════════
 def msg_dashboard(u: dict) -> str:
-    name = _e(u.get("name") or "there")
+    name = _e(u.get("name") or "bhai")
     if _premium_active(u):
         until = fmt_until(float(u.get("premium_until") or 0))
         return (
-            f"👑 <b>Welcome back, {name}.</b>\n\n"
-            "Your Premium desk is open. Lookups are unlimited, and the queue keeps a place for you.\n\n"
-            f"Membership through <b>{_e(until)}</b>.\n\n"
-            f"{_D}"
+            f"👑 <b>Waapas aa gaya, {name}?</b>\n\n"
+            f"Premium desk khula hai bhai.\n\n"
+            f"Membership <b>{_e(until)}</b> tak chalegi.\n\n{_D}"
         )
     used = _daily_used(u)
     allowance = FREE_DAILY_LIMIT + _bonus_today(int(u["id"]))
     left = max(0, allowance - used)
-    extra = ""
-    if _bonus_today(int(u["id"])):
-        extra = " Today's extra pulls from the spin are included.\n\n"
+    extra = " Aaj ke spin wale extra pulls bhi count ho rahe hain.\n\n" if _bonus_today(int(u["id"])) else ""
     return (
-        f"<b>Welcome, {name}.</b>\n\n"
-        "This is your private lookup desk. Send a 10-digit mobile number, or choose a destination below.\n\n"
-        f"Complimentary lookups left today · <b>{left}</b> of {allowance}.\n"
-        f"{extra}\n{_D}"
+        f"<b>Kya scene hai bhai, {name}?</b>\n\n"
+        f"Bata kis customer ki info chahiye. 10 digit number daal, ya neeche se choose kar.\n\n"
+        f"Aaj ke free lookups bache · <b>{left}</b> of {allowance}.\n{extra}\n{_D}"
     )
 
 def msg_profile(u: dict) -> str:
     gold = _premium_active(u)
     used = _daily_used(u)
     bonus = _bonus_today(int(u["id"]))
-    if gold or int(u["id"]) == ADMIN_ID:
-        allowance = "Unlimited"
-    else:
-        allowance = f"{max(0, FREE_DAILY_LIMIT + bonus - used)} left today"
-    if gold:
-        status = f"👑 Premium · until {_e(fmt_until(float(u.get('premium_until') or 0)))}"
-    elif int(u["id"]) == ADMIN_ID:
-        status = "Operator · unlimited lookups"
-    else:
-        status = "Complimentary"
+    allowance = "Unlimited" if (gold or int(u["id"]) == ADMIN_ID) else f"{max(0, FREE_DAILY_LIMIT + bonus - used)} aaj bache"
+    if gold: status = f"👑 Premium · {_e(fmt_until(float(u.get('premium_until') or 0)))} tak"
+    elif int(u["id"]) == ADMIN_ID: status = "Operator · lookups unlimited"
+    else: status = "Free wala desk"
     handle = f"@{_e(u['username'])}\n" if u.get("username") else ""
     link = f"{BOT_LINK}?start=ref_{u['id']}"
+    streak = int(u.get("streak_count") or 0)
     return (
-        f"{'👑 ' if gold else ''}<b>{_e(u.get('name') or 'Member')}</b>\n"
-        f"{handle}"
-        f"ID · <code>{u['id']}</code>\n"
+        f"{'👑 ' if gold else ''}<b>{_e(u.get('name') or 'Bhai')}</b>\n"
+        f"{handle}ID · <code>{u['id']}</code>\n"
         f"Status · {status}\n\n"
         f"Lookups · <b>{int(u.get('searches') or 0)}</b>\n"
-        f"Today · <b>{_e(str(allowance))}</b>\n"
-        f"Invitations · <b>{int(u.get('referral_count') or 0)}</b>\n\n"
-        "Five people who join with your link earn you a day of Premium.\n"
-        f"<code>{_e(link)}</code>\n\n"
-        f"{_D}"
+        f"Aaj · <b>{_e(str(allowance))}</b>\n"
+        f"Streak · <b>{streak}</b> / {STREAK_INTERVAL}\n"
+        f"Invites · <b>{int(u.get('referral_count') or 0)}</b>\n\n"
+        f"Paanch log tere link se aaye toh ek din premium pakka.\n"
+        f"<code>{_e(link)}</code>\n\n{_D}"
     )
 
 def msg_history(u: dict) -> str:
     hist = list(u.get("history") or [])[-10:]
     if not hist:
-        return f"<b>History</b>\n\nNothing filed yet. A lookup will keep its place here.\n\n{_D}"
-    lines = ["<b>Recent lookups</b>", ""]
+        return f"<b>History</b>\n\nAbhi kuch file nahi hui bhai.\n\n{_D}"
+    lines = ["<b>Pichli lookups</b>", ""]
     for item in reversed(hist):
         found = item.get("found")
-        if found == 0:
-            tag = "no match"
-        elif found == 1:
-            tag = "1 match"
-        elif isinstance(found, int):
-            tag = f"{found} matches"
-        else:
-            tag = "filed"
-        lines.append(
-            f"• <code>{_e(str(item.get('query', '')))}</code> · {_e(str(item.get('at', '')))} · {tag}"
-        )
+        tag = "koi match nahi" if found == 0 else ("1 match" if found == 1 else f"{found} matches" if isinstance(found, int) else "file ho gayi")
+        lines.append(f"• <code>{_e(str(item.get('query', '')))}</code> · {_e(str(item.get('at', '')))} · {tag}")
     lines += ["", _D]
     return "\n".join(lines)
 
 def msg_pricing(u: dict) -> str:
+    if _utr_locked(int(u["id"])):
+        left = fmt_td(int(_utr_lock_until(int(u["id"])) - time.time()))
+        return (
+            f"<b>Premium lock hai bhai.</b>\n\n"
+            f"UTR spam ka natija. { _e(left) } baad aana.\n\n{_D}"
+        )
     if _premium_active(u):
         head = (
-            f"👑 <b>Premium is active</b> through {_e(fmt_until(float(u.get('premium_until') or 0)))}.\n\n"
-            "Extend it whenever you like. Payment is manual UPI — a person confirms it."
+            f"👑 <b>Premium on hai</b> {_e(fmt_until(float(u.get('premium_until') or 0)))} tak.\n\n"
+            f"Extend karna ho toh kar le. Payment manual UPI hai — koi insaan confirm karega."
         )
     else:
         head = (
             "<b>Premium membership</b>\n\n"
-            "Unlimited lookups, a gold desk, and a calmer place in the queue. "
-            "You pay by UPI. An operator confirms the reference, then your memo arrives."
+            "Unlimited lookups, gold desk, aur line mein thodi izzat. UPI kar. "
+            "Operator reference dekhega, phir memo aayega."
         )
-    return f"{head}\n\nChoose a term.\n\n{_D}"
+    return f"{head}\n\nTerm choose kar.\n\n{_D}"
 
 def msg_support_prompt() -> str:
     return (
-        "<b>Support</b>\n\n"
-        "Write the next message as you would to a person. It goes to the operator, "
-        "and their reply comes back here.\n\n"
-        f"{_D}"
+        f"<b>Support</b>\n\n"
+        f"Agle message ko aise likh jaise insaan ko likhta hai. Operator ke paas jayega, jawab yahin aayega.\n\n{_D}"
     )
 
 def msg_force() -> str:
     lines = [
-        "<b>One step before the desk opens</b>",
+        "<b>Pehle ye ek kaam kar</b>",
         "",
-        "Join the channels below, then tap verify. We check membership before letting a lookup through.",
+        "Neeche wale channels join kar, phir check daba. Bina membership ke lookup nahi chalega.",
         "",
     ]
     for ch in FORCE_CHANNELS:
@@ -744,77 +868,60 @@ def msg_force() -> str:
     lines += ["", _D]
     return "\n".join(lines)
 
-def msg_stats(u: dict) -> str:
-    return msg_profile(u)
-
 def msg_help() -> str:
     return (
-        f"ℹ️ <b>How the desk works</b>\n\n"
-        "Send a 10-digit mobile number. Complimentary members have "
-        f"{FREE_DAILY_LIMIT} lookups a day. Premium lifts the cap.\n\n"
-        "Contacts and identity numbers arrive hidden. Tap them to reveal.\n\n"
-        f"{_D}"
+        f"ℹ️ <b>Desk kaise chalti hai</b>\n\n"
+        f"10 digit customer number bhej. Free walon ke {FREE_DAILY_LIMIT} lookups roz. Premium pe cap hat jaata hai.\n\n"
+        f"Number aur ID chhupe aate hain. Tap karke khol.\n\n{_D}"
     )
 
 def msg_queue(pos: int, query: str) -> str:
     bar = q_bar(pos)
     if pos == 1:
-        return (
-            f"<b>You're next.</b>\n"
-            f"{bar}\n"
-            f"🔎 <code>{_e(query)}</code>\n"
-            "The desk is opening your file."
-        )
+        return f"<b>Teri baari hai bhai.</b>\n{bar}\n🔎 <code>{_e(query)}</code>\nFile khol raha hoon."
     return (
-        f"<b>Queue position {pos}</b>\n"
-        f"{bar}\n"
-        f"🔎 <code>{_e(query)}</code>\n"
-        f"Estimated wait · ~{pos * 3}s"
+        f"<b>Line lag gayi hai bhai, tu #{pos} pe hai.</b>\n{bar}\n"
+        f"🔎 <code>{_e(query)}</code>\nIntezar · ~{pos * 3}s"
     )
 
 def msg_searching(query: str) -> str:
-    return f"🔍 Scanning databases...\n🔎 <code>{_e(query)}</code>"
+    return f"Bhai customer data dhoond raha hoon, thoda sabar kar...\n🔎 <code>{_e(query)}</code>"
 
 def msg_stage(query: str, label: str) -> str:
     return f"{label}\n🔎 <code>{_e(query)}</code>"
 
 def msg_no_result(query: str) -> str:
     return (
-        f"<b>No record matches</b>\n"
-        f"🔎 <code>{_e(query)}</code>\n\n"
-        "Nothing in the directory carries that number.\n\n"
-        f"{_D}"
+        f"<b>Kuch nahi mila bhai</b>\n🔎 <code>{_e(query)}</code>\n\n"
+        f"Is number pe koi record nahi pada.\n\n{_D}"
     )
 
 def msg_limit(u: dict) -> str:
     return (
-        "<b>Today's complimentary lookups are used.</b>\n\n"
-        f"Free members have {FREE_DAILY_LIMIT} a day. Premium removes the cap — "
-        "the plans sit under Premium, and a person confirms the UPI reference.\n\n"
-        f"Lookups on file · <b>{int(u.get('searches') or 0)}</b>\n\n"
-        f"{_D}"
+        f"<b>Aaj ke free lookups khatam bhai.</b>\n\n"
+        f"Free members ko {FREE_DAILY_LIMIT} roz milte hain. Premium pe cap nahi.\n\n"
+        f"File pe lookups · <b>{int(u.get('searches') or 0)}</b>\n\n{_D}"
     )
 
 def msg_spin(u: dict, pending: str | None) -> str:
     left = _jackpots_left()
-    held = ""
-    if pending:
-        held = f"\n\nYour number <code>{_e(pending)}</code> is held. It runs after this pull."
+    held = f"\n\nTera number <code>{_e(pending)}</code> ruk gaya hai. Spin ke baad chalega." if pending else ""
     return (
-        "🎰 <b>Lucky spin</b>\n\n"
-        f"Next window · <b>{_e(_countdown())}</b>\n"
+        f"🎰 <b>Lucky spin</b>\n\n"
+        f"Agli window · <b>{_e(_countdown())}</b>\n"
         f"Cadence · {SPIN_INTERVAL}\n"
-        f"Premium jackpots left this window · <b>{left}</b> of {SPIN_WINNER_LIMIT}\n\n"
-        "One pull per window. Three sevens — the slot landing on 64 — grants a day of Premium, "
-        "while the house still has a jackpot to give. Smaller alignments add lookups for today."
-        f"{held}\n\n{_D}"
+        f"Is window ke premium jackpot bache · <b>{left}</b> of {SPIN_WINNER_LIMIT}\n\n"
+        f"Ek window, ek kheench. Teen seven pe ek din Premium.{held}\n\n{_D}"
     )
 
 def msg_welcome(name: str) -> str:
-    return msg_dashboard({"id": 0, "name": name, "is_premium": False, "premium_until": 0, "daily_searches": 0, "last_search_date": "", "searches": 0})
+    return msg_dashboard({
+        "id": 0, "name": name, "is_premium": False, "premium_until": 0,
+        "daily_searches": 0, "last_search_date": "", "searches": 0,
+    })
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  RESULT CARD
+#  RESULT CARD & HTML
 # ═══════════════════════════════════════════════════════════════════════════════
 def _spoiler(value: str) -> str:
     return f"<tg-spoiler><code>{_e(value)}</code></tg-spoiler>"
@@ -831,127 +938,93 @@ def format_card(row: dict, query: str, elapsed: float | None = None) -> str:
     district    = sv(row.get("district"))
     town        = sv(row.get("town"))
 
-    lines = ["<b>Directory note</b>", "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄", f"🔎 <code>{_e(query)}</code>", ""]
-    if name:        lines.append(f"👤 <b>Name</b> ➡️ {_e(name)}")
-    if fathersName: lines.append(f"👨 <b>Father</b> ➡️ {_e(fathersName)}")
-    if phoneNumber: lines.append(f"📱 <b>Contact</b> ➡️ {_spoiler(phoneNumber)}")
-    if otherNumber: lines.append(f"📞 <b>Alt</b> ➡️ {_spoiler(otherNumber)}")
-    if aadharNumber:lines.append(f"🪪 <b>ID</b> ➡️ {_spoiler(aadharNumber)}")
-    if address:     lines.append(f"🏠 <b>Address</b>\n<blockquote expandable>{_e(address)}</blockquote>")
+    lines = ["<b>Customer file</b>", "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄", f"🔎 <code>{_e(query)}</code>", ""]
+    if name:         lines.append(f"👤 <b>Naam</b> ➡️ {_e(name)}")
+    if fathersName:  lines.append(f"👨 <b>Father</b> ➡️ {_e(fathersName)}")
+    if phoneNumber:  lines.append(f"📱 <b>Number</b> ➡️ {_spoiler(phoneNumber)}")
+    if otherNumber:  lines.append(f"📞 <b>Dusra number</b> ➡️ {_spoiler(otherNumber)}")
+    if aadharNumber: lines.append(f"🪪 <b>ID</b> ➡️ {_spoiler(aadharNumber)}")
+    if address:      lines.append(f"🏠 <b>Address</b>\n<blockquote expandable>{_e(address)}</blockquote>")
     loc = ", ".join(x for x in [town, district, state] if x)
-    if loc:         lines.append(f"📍 <b>Location</b> ➡️ {_e(loc)}")
-    if pincode:     lines.append(f"📮 <b>Zip</b> ➡️ <code>{_e(pincode)}</code>")
-
+    if loc:          lines.append(f"📍 <b>Location</b> ➡️ {_e(loc)}")
+    if pincode:      lines.append(f"📮 <b>Zip</b> ➡️ <code>{_e(pincode)}</code>")
     lines += ["", f"🕰 {ts_str()}"]
     if elapsed is not None:
         lines.append(f"⚡ Speed: {elapsed_label(elapsed)}")
-        if elapsed < 1.0:
-            lines.append("🏎️ BLAZING FAST")
+        if elapsed < 1.0: lines.append("🏎️ BHAI YE TOH ROCKET THA")
     lines.append(_D)
     return "\n".join(lines)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HTML  ·  reports and membership memos share one press style
-# ═══════════════════════════════════════════════════════════════════════════════
 _HTML_CSS = """
 :root { --ink:#16130f; --paper:#f7f1e6; --gold:#8a6d3b; --line:#e0d3bf; --mute:#6e6458; }
 * { box-sizing: border-box; }
-body { margin:0; background:#e7dcc6; color:var(--ink); font: 16px/1.55 Georgia, "Times New Roman", serif; }
+body { margin:0; background:#e7dcc6; color:var(--ink); font: 16px/1.55 Georgia, serif; }
 article { max-width: 680px; margin: 36px auto; background: var(--paper); padding: 48px 44px 40px; }
-.kicker { margin:0; font: 600 11px/1.4 "Gill Sans", "Trebuchet MS", sans-serif; letter-spacing: .22em; text-transform: uppercase; color: var(--gold); }
+.kicker { margin:0; font: 600 11px/1.4 sans-serif; letter-spacing: .22em; text-transform: uppercase; color: var(--gold); }
 h1 { font-weight: 500; font-size: 36px; line-height: 1.15; margin: 10px 0 0; }
 .rule { height: 1px; border: 0; margin: 22px 0; background: linear-gradient(90deg, #c6a15b, transparent); }
-.rows { display: grid; grid-template-columns: 168px 1fr; gap: 12px 18px; }
-.k { font: 600 11px/1.4 "Gill Sans", "Trebuchet MS", sans-serif; letter-spacing: .08em; text-transform: uppercase; color: var(--mute); padding-top: 4px; }
-.v { margin:0; }
+.rows { display: grid; grid-template-columns: 168px 1fr; gap: 12px 18px; word-wrap: break-word; max-width: 100%; overflow-wrap: break-word; }
+.k { font: 600 11px/1.4 sans-serif; letter-spacing: .08em; text-transform: uppercase; color: var(--mute); padding-top: 4px; }
+.v { margin:0; word-wrap: break-word; max-width: 100%; overflow-wrap: break-word; }
 .memo { margin-top: 28px; padding: 16px 0 0; border-top: 1px solid var(--line); }
-.memo b { font: 600 11px/1.4 "Gill Sans", "Trebuchet MS", sans-serif; letter-spacing: .18em; text-transform: uppercase; color: var(--gold); }
-.memo p { margin: 8px 0 0; font: 14px/1.55 "Gill Sans", "Trebuchet MS", sans-serif; color: #3a332b; }
-footer { margin-top: 28px; font: 12px/1.4 "Gill Sans", "Trebuchet MS", sans-serif; color: var(--mute); }
+.memo b { font: 600 11px/1.4 sans-serif; letter-spacing: .18em; text-transform: uppercase; color: var(--gold); }
+.memo p { margin: 8px 0 0; font: 14px/1.55 sans-serif; color: #3a332b; }
+footer { margin-top: 28px; font: 12px/1.4 sans-serif; color: var(--mute); }
 """
 
 def _html_page(title: str, kicker: str, pairs: list[tuple[str, str]], memo: str) -> str:
-    cells = []
-    for label, value in pairs:
-        if not value:
-            continue
-        cells.append(f"<div class='k'>{_e(label)}</div><p class='v'>{value}</p>")
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{_e(title)}</title>
-<style>{_HTML_CSS}</style>
-</head>
-<body>
-<article>
-  <p class="kicker">{_e(kicker)}</p>
-  <h1>{_e(title)}</h1>
-  <hr class="rule"/>
-  <section class="rows">
-    {''.join(cells)}
-  </section>
-  <section class="memo">
-    <b>Memo</b>
-    <p>{memo}</p>
-  </section>
-  <footer>{_e(BOT_NAME)} · Private desk · {_e(ts_str())}</footer>
-</article>
-</body>
-</html>
-"""
+    cells = [f"<div class='k'>{_e(l)}</div><p class='v'>{v}</p>" for l, v in pairs if v]
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>{_e(title)}</title><style>{_HTML_CSS}</style></head>
+<body><article><p class="kicker">{_e(kicker)}</p><h1>{_e(title)}</h1><hr class="rule"/>
+<section class="rows">{''.join(cells)}</section>
+<section class="memo"><b>Memo</b><p>{memo}</p></section>
+<footer>{_e(BOT_NAME)} · Private desk · {_e(ts_str())}</footer></article></body></html>"""
 
 def generate_html(row: dict, query: str) -> str:
     address = clean_addr(row.get("address"))
     loc = ", ".join(x for x in [sv(row.get("town")), sv(row.get("district")), sv(row.get("state"))] if x)
     pairs = [
         ("Query", f"<code>{_e(query)}</code>"),
-        ("Name", _e(sv(row.get("name")))),
+        ("Naam", _e(sv(row.get("name")))),
         ("Father", _e(sv(row.get("fathersName")))),
-        ("Contact", _e(sv(row.get("phoneNumber")))),
-        ("Alternate", _e(sv(row.get("otherNumber")))),
-        ("Identity", _e(sv(row.get("aadharNumber")))),
+        ("Number", _e(sv(row.get("phoneNumber")))),
+        ("Dusra number", _e(sv(row.get("otherNumber")))),
+        ("ID", _e(sv(row.get("aadharNumber")))),
         ("Address", _e(address)),
         ("Location", _e(loc)),
-        ("Postal code", _e(sv(row.get("pincode")))),
+        ("Zip", _e(sv(row.get("pincode")))),
     ]
-    memo = (
-        f"{_e(BOT_NAME)} prepared this note from the directory on file. "
-        "It is a private record of one lookup. Keep it, or destroy it — it is yours."
-    )
+    memo = f"{_e(BOT_NAME)} ne ye note directory se nikala. Private file hai. Rakh le, ya phaad de — teri marzi."
     title = sv(row.get("name")) or f"Note for {query}"
-    return _html_page(title, f"{BOT_NAME} · Directory note", pairs, memo)
+    return _html_page(title, f"{BOT_NAME} · Customer file", pairs, memo)
 
 def generate_receipt_html(user: dict, plan: dict, when: str, expiry: str, utr: str = "") -> str:
     pairs = [
-        ("Member", _e(user.get("name") or "Member")),
-        ("Plan bought", _e(plan["name"])),
-        ("Amount paid", f"₹{_e(str(plan['amount']))}"),
-        ("Date and time", _e(when)),
+        ("Member", _e(user.get("name") or "Bhai")),
+        ("Plan", _e(plan["name"])),
+        ("Amount", f"₹{_e(str(plan['amount']))}"),
+        ("Waqt", _e(when)),
         ("Expiry", _e(expiry)),
-        ("Lookups to date", _e(str(int(user.get("searches") or 0)))),
+        ("Lookups ab tak", _e(str(int(user.get("searches") or 0)))),
         ("Reference", _e(utr)),
     ]
-    memo = (
-        f"{_e(BOT_NAME)} confirms this membership was settled by hand against the UPI reference "
-        "the operator approved. The term starts at approval and ends on the expiry above. "
-        "This memo is your record. Keep it with your papers."
-    )
-    title = f"{plan['name']} · {user.get('name') or 'Member'}"
-    return _html_page(title, f"{BOT_NAME} · Membership memo", pairs, memo)
+    memo = f"{_e(BOT_NAME)} confirm karta hai — ye membership haath se settle hui, jo UTR operator ne approve kiya."
+    return _html_page(f"{plan['name']} · {user.get('name') or 'Bhai'}", f"{BOT_NAME} · Membership memo", pairs, memo)
 
 def send_html_doc(cid: int, row: dict, query: str) -> None:
-    filename = f"{BOT_NAME}_Report_{sv(row.get('phoneNumber')) or 'note'}.html"
-    send_html_file(cid, filename, generate_html(row, query), "📄 Your directory note is attached.")
-
-def send_receipt(cid: int, user: dict, plan: dict, when: str, expiry: str, utr: str) -> None:
-    filename = f"{BOT_NAME}_Memo_{utr}.html"
     send_html_file(
         cid,
-        filename,
+        f"{BOT_NAME}_Report_{sv(row.get('phoneNumber')) or 'note'}.html",
+        generate_html(row, query),
+        "📄 Le bhai, teri directory note attach hai.",
+    )
+
+def send_receipt(cid: int, user: dict, plan: dict, when: str, expiry: str, utr: str) -> None:
+    send_html_file(
+        cid,
+        f"{BOT_NAME}_Memo_{utr}.html",
         generate_receipt_html(user, plan, when, expiry, utr),
-        f"👑 <b>Premium is active</b> through {_e(expiry)}. Your memo is attached.",
+        f"👑 <b>Premium on hai</b> {_e(expiry)} tak. Memo file mein hai.",
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -959,28 +1032,22 @@ def send_receipt(cid: int, user: dict, plan: dict, when: str, expiry: str, utr: 
 # ═══════════════════════════════════════════════════════════════════════════════
 def _apply_referral(cid: int, payload: str) -> None:
     match = re.fullmatch(r"ref_(\d+)", (payload or "").strip())
-    if not match:
-        return
+    if not match: return
     inviter_id = int(match.group(1))
-    if inviter_id == cid:
-        return
+    if inviter_id == cid: return
     grant_until: float | None = None
     with _sl:
         user = _get_ud(cid)
-        if user.get("referred_by"):
-            return
+        if user.get("referred_by"): return
         inviter = user_data.get(inviter_id) or _load_user(inviter_id)
-        if inviter is None:
-            return
+        if inviter is None: return
         user_data[inviter_id] = inviter
         user["referred_by"] = inviter_id
         inviter["referral_count"] = int(inviter.get("referral_count") or 0) + 1
-        if inviter["referral_count"] == 5:
-            grant_until = _extend_premium(inviter, 1)
+        if inviter["referral_count"] == 5: grant_until = _extend_premium(inviter, 1)
         _save_user(user)
         _save_user(inviter)
-    if grant_until is not None:
-        _notify_referral_premium(inviter_id, grant_until)
+    if grant_until is not None: _notify_referral_premium(inviter_id, grant_until)
 
 def _notify_referral_premium(inviter_id: int, until: float) -> None:
     with _sql_lock:
@@ -988,64 +1055,39 @@ def _notify_referral_premium(inviter_id: int, until: float) -> None:
             "SELECT name, username FROM users WHERE referred_by = ? ORDER BY chat_id",
             (inviter_id,),
         ).fetchall()
-    names = []
-    for row in rows:
-        handle = (row["username"] or "").strip()
-        names.append(f"@{handle}" if handle else (row["name"] or "Member"))
-    listing = "\n".join(f"• {_e(name)}" for name in names) or "• New members"
+    names = [f"@{row['username']}" if row["username"] else (row["name"] or "Bhai") for row in rows]
     send_msg(
         inviter_id,
-        (
-            "<b>Your invitations landed.</b>\n\n"
-            "Five people joined through your link. A day of Premium is now on your desk.\n\n"
-            f"{listing}\n\n"
-            f"Premium access runs until <b>{_e(fmt_until(until))}</b>."
-        ),
+        "<b>Tere invites land ho gaye.</b>\n\n"
+        "Paanch log tere link se aaye. Ek din ka Premium desk pe lag gaya.\n\n"
+        + "\n".join(f"• {_e(name)}" for name in names)
+        + f"\n\nPremium <b>{_e(fmt_until(until))}</b> tak chalega.",
     )
 
 def _upi_uri(plan: dict) -> str:
-    query = urllib.parse.urlencode({
-        "pa": UPI_ID,
-        "pn": BOT_NAME,
-        "am": f"{plan['amount']:.2f}",
-        "cu": "INR",
-        "tn": f"{BOT_NAME} {plan['name']}",
+    return "upi://pay?" + urllib.parse.urlencode({
+        "pa": UPI_ID, "pn": BOT_NAME, "am": f"{plan['amount']:.2f}", "cu": "INR", "tn": f"{BOT_NAME} {plan['name']}",
     })
-    return "upi://pay?" + query
 
 def _open_checkout(cid: int, mid: int, plan: dict) -> None:
+    if _utr_locked(cid):
+        left = fmt_td(int(_utr_lock_until(cid) - time.time()))
+        desk_edit(cid, mid, f"Bhai Premium lock hai. {_e(left)} baad try kar. UTR spam ka natija.", kb=back_kb())
+        return
     flow[cid] = {"mode": "checkout", "plan": plan["id"]}
     uri = _upi_uri(plan)
-    qr = (
-        "https://api.qrserver.com/v1/create-qr-code/?size=640x640&margin=16&data="
-        + urllib.parse.quote(uri, safe="")
-    )
+    qr = "https://api.qrserver.com/v1/create-qr-code/?size=640x640&margin=16&data=" + urllib.parse.quote(uri, safe="")
     caption = (
         f"<b>{_e(plan['name'])}</b> · ₹{plan['amount']}\n"
         f"UPI ID · <code>{_e(UPI_ID)}</code>\n\n"
-        "Pay the exact amount from any UPI app. Then tap the button and send the 12-digit UTR."
+        f"Exact amount kisi bhi UPI app se bhej. Phir button daba ke 12 digit UTR daal."
     )
-    kb = [[
-        {"text": "✅ I have Paid", "callback_data": f"paid:{plan['id']}"},
-    ], [
-        {"text": "Back", "callback_data": "premium"},
-    ]]
-    res = tg("sendPhoto", {
-        "chat_id": cid,
-        "photo": qr,
-        "caption": caption,
-        "parse_mode": "HTML",
-        "reply_markup": {"inline_keyboard": kb},
-    })
+    kb = [[{"text": "✅ Payment ho gaya", "callback_data": f"paid:{plan['id']}"}], [{"text": "Wapas", "callback_data": "premium"}]]
+    res = tg("sendPhoto", {"chat_id": cid, "photo": qr, "caption": caption, "parse_mode": "HTML", "reply_markup": {"inline_keyboard": kb}})
     if res.get("ok"):
-        edit_msg(cid, mid, "The UPI code is just above. Pay the exact amount, then confirm.")
+        desk_edit(cid, mid, "UPI code upar hai. Exact amount bhej, phir confirm kar.")
         return
-    edit_msg(
-        cid,
-        mid,
-        caption + f"\n\nPay link\n<code>{_e(uri)}</code>",
-        kb=kb,
-    )
+    desk_edit(cid, mid, caption + f"\n\nPay link\n<code>{_e(uri)}</code>", kb=kb)
 
 def _store_payment(user: dict, plan: dict, utr: str) -> str | None:
     with _sql_lock:
@@ -1053,14 +1095,11 @@ def _store_payment(user: dict, plan: dict, utr: str) -> str | None:
             "SELECT id, status FROM payments WHERE utr = ? AND status IN ('pending', 'approved')",
             (utr,),
         ).fetchone()
-        if existing:
-            return None
+        if existing: return None
         payment_id = uuid.uuid4().hex[:12]
         _sql.execute(
-            """
-            INSERT INTO payments (id, chat_id, plan_id, plan_name, amount, days, utr, status, created_at, settled_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)
-            """,
+            "INSERT INTO payments (id, chat_id, plan_id, plan_name, amount, days, utr, status, created_at, settled_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)",
             (payment_id, int(user["id"]), plan["id"], plan["name"], int(plan["amount"]), int(plan["days"]), utr, time.time()),
         )
         _sql.commit()
@@ -1069,8 +1108,8 @@ def _store_payment(user: dict, plan: dict, utr: str) -> str | None:
 def _forward_utr(user: dict, plan: dict, utr: str, payment_id: str) -> None:
     handle = f" (@{_e(user['username'])})" if user.get("username") else ""
     text = (
-        "<b>Payment to review</b>\n\n"
-        f"Member · {_e(user.get('name') or 'Member')}{handle}\n"
+        f"<b>Payment check kar</b>\n\n"
+        f"Banda · {_e(user.get('name') or 'Bhai')}{handle}\n"
         f"ID · <code>{user['id']}</code>\n"
         f"Plan · {_e(plan['name'])}\n"
         f"Amount · ₹{plan['amount']}\n"
@@ -1081,10 +1120,7 @@ def _forward_utr(user: dict, plan: dict, utr: str, payment_id: str) -> None:
         {"text": "Reject ❌", "callback_data": f"no:{payment_id}"},
     ]]
     send_msg(ADMIN_ID, text, kb=kb)
-    send_msg(
-        int(user["id"]),
-        "Thank you. That reference is with the operator. You'll hear back here once it is settled.",
-    )
+    send_msg(int(user["id"]), "Shukriya. Reference operator ke paas hai. Settle hote hi yahan sunega.")
 
 def _load_payment(payment_id: str) -> sqlite3.Row | None:
     with _sql_lock:
@@ -1092,34 +1128,24 @@ def _load_payment(payment_id: str) -> sqlite3.Row | None:
 
 def _mark_payment(payment_id: str, status: str) -> None:
     with _sql_lock:
-        _sql.execute(
-            "UPDATE payments SET status = ?, settled_at = ? WHERE id = ?",
-            (status, time.time(), payment_id),
-        )
+        _sql.execute("UPDATE payments SET status = ?, settled_at = ? WHERE id = ?", (status, time.time(), payment_id))
         _sql.commit()
 
 def _settle_payment(payment_id: str, approve: bool, admin_mid: int | None) -> None:
     row = _load_payment(payment_id)
-    if row is None:
-        return
+    if row is None: return
     if row["status"] != "pending":
-        edit_msg(ADMIN_ID, admin_mid, f"This reference is already {row['status']}.")
+        edit_msg(ADMIN_ID, admin_mid, f"Ye reference pehle hi {row['status']} ho chuka.")
         return
     plan = PLANS.get(row["plan_id"]) or {
-        "id": row["plan_id"],
-        "name": row["plan_name"],
-        "days": int(row["days"]),
-        "amount": int(row["amount"]),
+        "id": row["plan_id"], "name": row["plan_name"], "days": int(row["days"]), "amount": int(row["amount"]),
     }
     member_id = int(row["chat_id"])
     if not approve:
         _mark_payment(payment_id, "rejected")
-        edit_msg(ADMIN_ID, admin_mid, f"Declined · UTR <code>{_e(row['utr'])}</code> · {_e(plan['name'])}")
-        send_msg(
-            member_id,
-            "The operator couldn't match that reference, so Premium wasn't opened. "
-            "If the amount did leave your account, send the UTR once more, or write through Support.",
-        )
+        _reset_utr_attempts(member_id)
+        edit_msg(ADMIN_ID, admin_mid, f"Reject · UTR <code>{_e(row['utr'])}</code> · {_e(plan['name'])}")
+        send_msg(member_id, "Operator ko ye reference match nahi hua, isliye Premium nahi khula.")
         return
     when = ts_str()
     with _sl:
@@ -1129,17 +1155,10 @@ def _settle_payment(payment_id: str, approve: bool, admin_mid: int | None) -> No
         snapshot = dict(user)
         snapshot["history"] = list(user.get("history") or [])
     _mark_payment(payment_id, "approved")
+    _reset_utr_attempts(member_id)
     expiry = fmt_until(until)
-    edit_msg(
-        ADMIN_ID,
-        admin_mid,
-        f"Approved · {_e(snapshot.get('name') or 'Member')} · {_e(plan['name'])} · until {_e(expiry)}",
-    )
-    send_msg(
-        member_id,
-        f"👑 <b>Premium is open.</b>\n\n{_e(plan['name'])} runs until <b>{_e(expiry)}</b>. "
-        "Your memo is attached as a file.",
-    )
+    edit_msg(ADMIN_ID, admin_mid, f"Approve · {_e(snapshot.get('name') or 'Bhai')} · {_e(plan['name'])} · {_e(expiry)} tak")
+    send_msg(member_id, f"👑 <b>Premium khul gaya.</b>\n\n{_e(plan['name'])} chalega <b>{_e(expiry)}</b> tak. Memo file mein hai.")
     send_receipt(member_id, snapshot, plan, when, expiry, str(row["utr"]))
 
 def _present_spin(cid: int, pending: str | None) -> None:
@@ -1147,16 +1166,14 @@ def _present_spin(cid: int, pending: str | None) -> None:
         user = _get_ud(cid)
         text = msg_spin(user, pending)
     flow[cid] = {"mode": "spin", "pending_query": pending}
-    kb = [[{"text": "🎰 Spin Now", "callback_data": "spin"}]] if _spin_due(user) else back_kb()
+    kb = [[{"text": "🎰 Spin Maar", "callback_data": "spin"}]] if _spin_due(user) else back_kb()
     send_msg(cid, text, kb=kb)
 
 def _finish_spin(cid: int, value: int) -> None:
     pending = None
     state = flow.get(cid) or {}
-    if state.get("mode") == "spin":
-        pending = state.get("pending_query")
+    if state.get("mode") == "spin": pending = state.get("pending_query")
     _clear_flow(cid)
-    prize_line = "A quiet spin. Nothing extra this time — the next window will be here when it is."
     with _sl:
         user = _get_ud(cid)
         user["last_spin_date"] = _window_id()
@@ -1164,42 +1181,29 @@ def _finish_spin(cid: int, value: int) -> None:
         if kind == "premium":
             if _take_jackpot():
                 until = _extend_premium(user, 1)
-                prize_line = (
-                    f"The reels settled on <b>64</b> — three sevens. "
-                    f"A day of Premium is yours, through <b>{_e(fmt_until(until))}</b>."
-                )
+                prize_line = f"Reels pe <b>64</b> aaya — teen seven. Ek din Premium tera, <b>{_e(fmt_until(until))}</b> tak."
             else:
                 _add_bonus(cid, 5)
-                prize_line = (
-                    "The reels settled on <b>64</b>, but the five Premium jackpots for this window "
-                    "are already spoken for. Five extra lookups are on the house today instead."
-                )
+                prize_line = "Reels pe <b>64</b> aaya, par is window ke paanch Premium jackpot khatam. Aaj 5 extra lookups de raha hoon."
         elif isinstance(kind, int):
             _add_bonus(cid, kind)
-            prize_line = (
-                f"The reels settled on <b>{value}</b>. "
-                f"{kind} extra lookup{'s' if kind != 1 else ''} {'are' if kind != 1 else 'is'} yours today."
-            )
+            prize_line = f"Reels pe <b>{value}</b> aaya. {kind} extra lookup{'s' if kind != 1 else ''} aaj tere."
         else:
-            prize_line = (
-                f"The reels settled on <b>{value}</b>. "
-                f"Nothing extra this time. Next window in <b>{_e(_countdown())}</b>."
-            )
+            prize_line = f"Reels pe <b>{value}</b> aaya. Is baar kuch extra nahi. Agli window <b>{_e(_countdown())}</b> mein."
         _save_user(user)
-    send_msg(cid, f"🎰 <b>Spin closed.</b>\n\n{prize_line}\n\n{_D}", kb=dashboard_kb())
-    if pending and pending.isdigit() and len(pending) == 10:
-        _enqueue_search(cid, pending)
+    send_msg(cid, f"🎰 <b>Spin khatam.</b>\n\n{prize_line}\n\n{_D}", kb=dashboard_kb())
+    if pending and pending.isdigit() and len(pending) == 10: _enqueue_search(cid, pending)
 
 def _run_spin(cid: int) -> None:
     with _sl:
         user = _get_ud(cid)
         if not _spin_due(user):
-            send_msg(cid, f"You've already taken this window's pull. Next one in <b>{_e(_countdown())}</b>.")
+            send_msg(cid, f"Is window ka spin le chuka hai bhai. Agla <b>{_e(_countdown())}</b> mein.")
             return
     dice = tg("sendDice", {"chat_id": cid, "emoji": "🎰"})
     value = ((dice.get("result") or {}).get("dice") or {}).get("value")
     if not isinstance(value, int):
-        send_msg(cid, "The reels didn't leave the table. Your pull is still unused — try Spin Now again.")
+        send_msg(cid, "Reels table pe atak gaye. Tera pull abhi bhi bacha hai — Spin Maar phir daba.")
         return
     _finish_spin(cid, value)
 
@@ -1208,24 +1212,20 @@ def _broadcast(audience: str, text: str) -> None:
     with _sql_lock:
         if audience == "prem":
             rows = _sql.execute(
-                "SELECT chat_id FROM users WHERE is_premium = 1 AND premium_until > ?",
+                "SELECT chat_id FROM users WHERE is_premium = 1 AND premium_until > ? AND COALESCE(is_banned, 0) = 0",
                 (now,),
             ).fetchall()
         else:
-            rows = _sql.execute("SELECT chat_id FROM users").fetchall()
-    sent = 0
-    failed = 0
-    body = f"<b>Note from the desk</b>\n\n{_e(text)}"
+            rows = _sql.execute("SELECT chat_id FROM users WHERE COALESCE(is_banned, 0) = 0").fetchall()
+    sent, failed = 0, 0
+    body = f"<b>Desk se note</b>\n\n{_e(text)}"
     for row in rows:
-        cid = int(row["chat_id"])
-        mid = send_msg(cid, body)
-        if mid:
-            sent += 1
-        else:
-            failed += 1
+        mid = send_msg(int(row["chat_id"]), body)
+        if mid: sent += 1
+        else: failed += 1
         time.sleep(0.05)
-    label = "Premium members" if audience == "prem" else "all members"
-    send_msg(ADMIN_ID, f"Broadcast to {label} closed. Delivered · <b>{sent}</b>. Unreached · <b>{failed}</b>.")
+    who = "Premium walon" if audience == "prem" else "sab members"
+    send_msg(ADMIN_ID, f"Broadcast {who} ko band. Pahuncha · <b>{sent}</b>. Nahi pahuncha · <b>{failed}</b>.")
 
 def admin_stats_text() -> str:
     now = time.time()
@@ -1236,23 +1236,143 @@ def admin_stats_text() -> str:
             (now,),
         ).fetchone()["n"])
         searches = int(_sql.execute("SELECT COALESCE(SUM(total_searches), 0) AS n FROM users").fetchone()["n"])
-    free = max(0, total - premium)
+        banned = int(_sql.execute("SELECT COUNT(*) AS n FROM users WHERE COALESCE(is_banned, 0) = 1").fetchone()["n"])
     return (
-        "<b>Admin</b>\n\n"
-        f"Total Users · <b>{total}</b>\n"
-        f"Free Users · <b>{free}</b>\n"
-        f"Premium Users · <b>{premium}</b>\n"
-        f"Total Searches · <b>{searches}</b>"
+        f"<b>Admin desk</b>\n\n"
+        f"Total users · <b>{total}</b>\n"
+        f"Free wale · <b>{max(0, total - premium)}</b>\n"
+        f"Premium wale · <b>{premium}</b>\n"
+        f"Banned · <b>{banned}</b>\n"
+        f"Total searches · <b>{searches}</b>\n\n"
+        f"Commands · /grant user_id days · /ban user_id · /csv · /logs · /broadcast"
     )
+
+def _admin_grant(cid: int, raw: str) -> None:
+    parts = raw.split()
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        send_msg(cid, "Format ye hai bhai: /grant <user_id> <days>")
+        return
+    target = int(parts[1])
+    days = int(parts[2])
+    if days <= 0:
+        send_msg(cid, "Days positive daal bhai. Negative premium nahi hota.")
+        return
+    with _sl:
+        user = _get_ud(target)
+        until = _extend_premium(user, days)
+        _save_user(user)
+    expiry = fmt_until(until)
+    send_msg(target, f"👑 Bhai sun, operator ne tujhe <b>{days}</b> din ka premium de diya. Chalega <b>{_e(expiry)}</b> tak.")
+    send_msg(cid, f"Ho gaya. <code>{target}</code> ko {days} din premium. <b>{_e(expiry)}</b> tak.")
+
+def _admin_ban(cid: int, raw: str) -> None:
+    parts = raw.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        send_msg(cid, "Format: /ban <user_id> — itna bhi mushkil hai?")
+        return
+    target = int(parts[1])
+    if target == ADMIN_ID:
+        send_msg(cid, "Apne aap ko ban karega? Dimag theek kar.")
+        return
+    with _sl:
+        user = _get_ud(target)
+        user["is_banned"] = 1
+        _save_user(user)
+    send_msg(target, _BAN_TEXT)
+    send_msg(cid, f"Ban lag gaya. <code>{target}</code> ab desk pe nahi aayega.")
+
+def admin_send_csv(cid: int) -> None:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["chat_id", "username", "is_premium", "premium_until", "total_searches"])
+    with _sql_lock:
+        rows = _sql.execute(
+            "SELECT chat_id, username, is_premium, premium_until, total_searches FROM users ORDER BY chat_id"
+        ).fetchall()
+    for row in rows:
+        writer.writerow([
+            row["chat_id"], row["username"] or "", row["is_premium"], row["premium_until"], row["total_searches"],
+        ])
+    data = buf.getvalue().encode("utf-8")
+    try:
+        requests.post(
+            f"{BASE_URL}/sendDocument",
+            data={"chat_id": str(cid), "caption": "📋 Users CSV, le bhai."},
+            files={"document": ("users.csv", io.BytesIO(data), "text/csv")},
+            timeout=25,
+        )
+    except Exception:
+        log.exception("csv send failed")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  WORKER THREAD
 # ═══════════════════════════════════════════════════════════════════════════════
-_LOAD_STAGES = (
-    "🔍 Scanning databases...",
-    "📡 Fetching data nodes...",
-    "🧬 Compiling intelligence...",
+_HACKER_STAGES = (
+    "Firewall tod raha hoon...",
+    "Deep web mein ghus raha hoon...",
+    "Data scrape ho raha hai...",
+    "Bhai server ka lock pick kar raha hoon...",
+    "Packet sniff kar raha hoon, chup chap...",
+    "Database ka parda hata raha hoon...",
+    "Encryption ko side se kaat raha hoon...",
+    "Node se node jump maar raha hoon...",
+    "Cache ko ulta padh raha hoon...",
+    "Proxy chain laga ke ghus raha hoon...",
+    "Log file ka postmortem chal raha hai...",
+    "Token forge kar raha hoon, tension mat le...",
+    "Index table ko hila raha hoon...",
+    "Shadow record nikaal raha hoon...",
+    "VPN ke peeche se jhaank raha hoon...",
+    "Query ko tez kar raha hoon...",
+    "Backup tape rewind ho rahi hai...",
+    "Metadata ko suljha raha hoon...",
+    "Port scan soft mode mein...",
+    "Customer file ka taala khol raha hoon...",
+    "Replica node se copy kheench raha hoon...",
+    "Hash match dhoond raha hoon...",
+    "Rate limit ko bypass karte hue...",
+    "Archive dungeon mein torch leke...",
+    "Schema ko samajh raha hoon bhai...",
+    "Phone node pe trace laga raha hoon...",
+    "Billing drawer khol raha hoon...",
+    "Old ticket stack hata raha hoon...",
+    "CDN cache ko ignore kar raha hoon...",
+    "Root folder mein pair chhupake...",
+    "Signal decrypt ho raha hai...",
+    "Duplicate rows ko phenk raha hoon...",
+    "Ledger ka last page palat raha hoon...",
+    "Geo tag ko pin kar raha hoon...",
+    "Session cookie tod raha hoon...",
+    "Mirror DB se confirm kar raha hoon...",
+    "Night batch ka dump khol raha hoon...",
+    "Address string ko seedha kar raha hoon...",
+    "ID vault ka combination try kar raha hoon...",
+    "Queue ke neeche se file kheench raha hoon...",
+    "Silent query, koi alarm nahi...",
+    "Column join laga raha hoon...",
+    "Parquet ke tukde jod raha hoon...",
+    "Hot shard pe land kar raha hoon...",
+    "Audit log ko side kar raha hoon...",
+    "Contact graph unfold ho raha hai...",
+    "Pincode grid pe plot kar raha hoon...",
+    "Final checksum maarta hoon...",
+    "Desk ke neeche se file nikaal raha hoon...",
+    "Ek second, result ko polish kar raha hoon...",
 )
+_last_stage_pick: tuple[str, ...] | None = None
+
+def _next_load_stages() -> tuple[str, ...]:
+    global _last_stage_pick
+    pick = tuple(random.sample(_HACKER_STAGES, 3))
+    spins = 0
+    while pick == _last_stage_pick and spins < 8:
+        pick = tuple(random.sample(_HACKER_STAGES, 3))
+        spins += 1
+    if pick == _last_stage_pick:
+        extra = next(s for s in _HACKER_STAGES if s not in pick)
+        pick = (pick[0], pick[1], extra)
+    _last_stage_pick = pick
+    return pick
 
 def worker() -> None:
     while True:
@@ -1263,27 +1383,21 @@ def worker() -> None:
             with _ql:
                 _queue_order[:] = [x for x in _queue_order if not (x["chat_id"] == cid and x["msg_id"] == mid)]
                 snapshot = list(_queue_order)
-
             for i, item in enumerate(snapshot, start=1):
                 try: edit_msg(item["chat_id"], item["msg_id"], msg_queue(i, item["query"]))
                 except: pass
-
             edit_msg(cid, mid, msg_searching(query))
-            for label in _LOAD_STAGES:
+            for label in _next_load_stages():
                 time.sleep(_STAGE_GAP)
                 edit_msg(cid, mid, msg_stage(query, label))
             t_db = time.monotonic()
             rows = db_search(query)
             elapsed = time.monotonic() - t_db
-            _ = t0
-
             with _sl:
                 global_stats["searches"] += 1
                 user_data[cid]["searches"] += 1
-
             if not rows:
-                with _sl:
-                    _remember(cid, query, 0)
+                with _sl: _remember(cid, query, 0)
                 edit_msg(cid, mid, msg_no_result(query), kb=back_kb())
             else:
                 with _sl:
@@ -1291,13 +1405,12 @@ def worker() -> None:
                     user_data[cid]["results"] += len(rows)
                     user_sessions[cid] = {"results": rows, "page": 0, "query": query, "ts": time.time()}
                     _remember(cid, query, len(rows))
-                edit_msg(cid, mid, msg_stage(query, "✅ Match Found!"))
+                edit_msg(cid, mid, msg_stage(query, "✅ Match mil gaya!"))
                 time.sleep(0.35)
-                text = format_card(rows[0], query, elapsed)
-                edit_msg(cid, mid, text, kb=result_kb(0, len(rows)))
+                edit_msg(cid, mid, format_card(rows[0], query, elapsed), kb=result_kb(0, len(rows)))
         except Exception:
             log.exception("Worker error")
-            edit_msg(cid, mid, "⚠️ The desk hit a snag on that lookup. Try once more in a moment.")
+            edit_msg(cid, mid, "⚠️ Bhai desk phat gaya is lookup pe. Thodi der ruk, phir try kar.")
         finally:
             with _sl: active_users.discard(cid)
             _search_q.task_done()
@@ -1328,9 +1441,9 @@ def admin_send_logs(cid: int) -> None:
     data = "\n".join(_ring.tail(150)).encode()
     requests.post(
         f"{BASE_URL}/sendDocument",
-        data  = {"chat_id": cid, "caption": "📋 <b>Logs</b>", "parse_mode": "HTML"},
-        files = {"document": ("bot_logs.txt", io.BytesIO(data), "text/plain")},
-        timeout = 25,
+        data={"chat_id": cid, "caption": "📋 <b>Logs</b>", "parse_mode": "HTML"},
+        files={"document": ("bot_logs.txt", io.BytesIO(data), "text/plain")},
+        timeout=25,
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1338,38 +1451,31 @@ def admin_send_logs(cid: int) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 def _enqueue_search(cid: int, query: str) -> None:
     with _sl:
-        if cid in active_users:
-            busy = True
-            user = user_data.get(cid) or _get_ud(cid)
-        else:
-            busy = False
-            user = _get_ud(cid)
-    if busy:
-        send_msg(cid, "Your lookup is already on the desk. The result is on its way.")
+        if cid in active_users: busy = True; user = user_data.get(cid) or _get_ud(cid)
+        else: busy = False; user = _get_ud(cid)
+        banned = cid != ADMIN_ID and int(user.get("is_banned") or 0) == 1
+    if banned:
+        send_msg(cid, _BAN_TEXT)
         return
-
+    if busy:
+        send_msg(cid, "Arre ruk bhai, teri pehli search abhi desk pe hai.")
+        return
+    if _touch_streak(cid):
+        send_msg(cid, "🔥 Bhai streak complete! Tere ko 1 free lookup mil gaya.")
     counted = False
     if cid != ADMIN_ID and not _premium_active(user):
         today = _today()
         with _sl:
             user = _get_ud(cid)
-            if user.get("last_search_date") != today:
-                user["daily_searches"] = 0
+            if user.get("last_search_date") != today: user["daily_searches"] = 0
             allowance = FREE_DAILY_LIMIT + _bonus_today(cid)
             used = int(user.get("daily_searches") or 0)
-            if used >= allowance:
-                blocked = True
-                _save_user(user)
+            if used >= allowance: blocked = True; _save_user(user)
             else:
-                blocked = False
-                counted = True
-                user["daily_searches"] = used + 1
-                user["last_search_date"] = today
-                _save_user(user)
+                blocked = False; counted = True; user["daily_searches"] = used + 1; user["last_search_date"] = today; _save_user(user)
         if blocked:
             send_msg(cid, msg_limit(user), kb=[[{"text": "👑 Premium", "callback_data": "premium"}]])
             return
-
     if _search_q.qsize() >= MAX_QUEUE:
         if counted:
             with _sl:
@@ -1377,15 +1483,12 @@ def _enqueue_search(cid: int, query: str) -> None:
                 if user:
                     user["daily_searches"] = max(0, int(user.get("daily_searches") or 0) - 1)
                     _save_user(user)
-        send_msg(cid, "The desk is at capacity. Give it a minute, then send the number again.")
+        send_msg(cid, "Desk full hai bhai. Ek minute ruk, phir number bhej.")
         return
-
     with _sl:
         active_users.add(cid)
-        if cid in user_data:
-            user_data[cid]["last_search"] = time.time()
-    with _ql:
-        approx_pos = len(_queue_order) + 1
+        if cid in user_data: user_data[cid]["last_search"] = time.time()
+    with _ql: approx_pos = len(_queue_order) + 1
     mid = send_msg(cid, msg_queue(approx_pos, query))
     if not mid:
         with _sl:
@@ -1394,12 +1497,10 @@ def _enqueue_search(cid: int, query: str) -> None:
                 user_data[cid]["daily_searches"] = max(0, int(user_data[cid].get("daily_searches") or 0) - 1)
                 _save_user(user_data[cid])
         return
-    with _ql:
-        _queue_order.append({"chat_id": cid, "msg_id": mid, "query": query})
+    with _ql: _queue_order.append({"chat_id": cid, "msg_id": mid, "query": query})
     _search_q.put((cid, query, mid))
 
 def _maybe_spin(cid: int, raw: str) -> bool:
-    """Hold the first note of the day, and any number, until this window's pull is taken."""
     is_num = raw.isdigit() and len(raw) == 10
     today = _today()
     first = seen_day.get(cid) != today
@@ -1407,8 +1508,7 @@ def _maybe_spin(cid: int, raw: str) -> bool:
     with _sl:
         user = _get_ud(cid)
         due = _spin_due(user)
-    if not due or not (first or is_num):
-        return False
+    if not due or not (first or is_num): return False
     _present_spin(cid, raw if is_num else None)
     return True
 
@@ -1417,150 +1517,149 @@ def _show_dashboard(cid: int, mid: int | None = None) -> None:
     with _sl:
         user = _get_ud(cid)
         text = msg_dashboard(user)
+    kb = dashboard_kb()
     if mid:
-        edit_msg(cid, mid, text, kb=dashboard_kb())
-    else:
-        send_msg(cid, text, kb=dashboard_kb())
+        tg("deleteMessage", {"chat_id": cid, "message_id": mid})
+    if not send_photo(cid, WELCOME_IMAGE_URL, text, kb=kb):
+        send_msg(cid, text, kb=kb)
 
 def _guard_join(cid: int, mid: int | None = None) -> bool:
-    if not _needs_join(cid):
-        return False
-    if mid:
-        edit_msg(cid, mid, msg_force(), kb=force_kb())
-    else:
-        send_msg(cid, msg_force(), kb=force_kb())
+    if not _needs_join(cid): return False
+    if mid: desk_edit(cid, mid, msg_force(), kb=force_kb())
+    else: send_msg(cid, msg_force(), kb=force_kb())
+    return True
+
+def _premium_lock_screen(cid: int, mid: int | None) -> bool:
+    if not _utr_locked(cid): return False
+    left = fmt_td(int(_utr_lock_until(cid) - time.time()))
+    desk_edit(
+        cid, mid,
+        f"<b>Premium lock hai bhai.</b>\n\nUTR spam ka natija. {_e(left)} baad aana.\n\n{_D}",
+        kb=back_kb(),
+    )
     return True
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CALLBACK HANDLER
+#  CALLBACK & MESSAGE HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 def handle_cb(cb: dict) -> None:
-    cid  = cb["message"]["chat"]["id"]
-    mid  = cb["message"]["message_id"]
-    data = cb["data"]
-    name = cb.get("from", {}).get("first_name", "User")
-    username = cb.get("from", {}).get("username", "")
+    cid, mid, data = cb["message"]["chat"]["id"], cb["message"]["message_id"], cb["data"]
+    name, username = cb.get("from", {}).get("first_name", "User"), cb.get("from", {}).get("username", "")
 
     if data.startswith(("ok:", "no:")):
         if cid != ADMIN_ID:
-            answer_cb(cb["id"], "Only the operator can settle this.", alert=True)
+            answer_cb(cb["id"], "Sirf operator settle kar sakta hai.", alert=True)
             return
         answer_cb(cb["id"])
-        payment_id = data.split(":", 1)[1]
-        _settle_payment(payment_id, data.startswith("ok:"), mid)
+        _settle_payment(data.split(":", 1)[1], data.startswith("ok:"), mid)
         return
 
     answer_cb(cb["id"])
     with _sl:
-        _get_ud(cid, name=name, username=username)
+        user = _get_ud(cid, name=name, username=username)
+    if cid != ADMIN_ID and _banned(user):
+        send_msg(cid, _BAN_TEXT)
+        return
 
     if data == "verify":
         if _needs_join(cid):
-            edit_msg(cid, mid, msg_force() + "\n\nStill waiting on a channel. Join, then tap verify again.", kb=force_kb())
+            desk_edit(cid, mid, msg_force() + "\n\nAbhi bhi channel baaki hai. Join kar, phir check daba.", kb=force_kb())
             return
         _show_dashboard(cid, mid)
         return
 
     if data in {"dashboard", "profile", "premium", "history", "support", "search", "stats", "help", "new_search"} or data.startswith(("plan:", "paid:", "pg:", "html:")) or data in {"spin", "noop"} or data.startswith("cast:"):
-        if data != "verify" and _guard_join(cid, mid):
-            return
+        if data != "verify" and _guard_join(cid, mid): return
 
-    if data in {"dashboard", "stats"}:
-        _show_dashboard(cid, mid)
+    if data in {"dashboard", "stats"}: _show_dashboard(cid, mid)
     elif data == "profile":
         _clear_flow(cid)
         with _sl:
             user = _get_ud(cid)
             text = msg_profile(user)
-        edit_msg(cid, mid, text, kb=back_kb())
+        desk_edit(cid, mid, text, kb=back_kb())
     elif data == "premium":
+        if _premium_lock_screen(cid, mid): return
         _clear_flow(cid)
         with _sl:
             user = _get_ud(cid)
             text = msg_pricing(user)
-        edit_msg(cid, mid, text, kb=pricing_kb())
+        desk_edit(cid, mid, text, kb=pricing_kb())
     elif data == "history":
         _clear_flow(cid)
         with _sl:
             user = _get_ud(cid)
             text = msg_history(user)
-        edit_msg(cid, mid, text, kb=back_kb())
+        desk_edit(cid, mid, text, kb=back_kb())
     elif data == "support":
         flow[cid] = {"mode": "WAITING_FOR_SUPPORT"}
-        edit_msg(cid, mid, msg_support_prompt(), kb=back_kb())
+        desk_edit(cid, mid, msg_support_prompt(), kb=back_kb())
     elif data in {"search", "new_search"}:
         _clear_flow(cid)
-        edit_msg(cid, mid, get_text(cid, "search_prompt"), kb=back_kb())
+        desk_edit(cid, mid, get_text(cid, "search_prompt"), kb=back_kb())
     elif data == "help":
-        edit_msg(cid, mid, msg_help(), kb=back_kb())
+        desk_edit(cid, mid, msg_help(), kb=back_kb())
     elif data.startswith("plan:"):
+        if _premium_lock_screen(cid, mid): return
         plan = PLANS.get(data.split(":", 1)[1])
-        if plan:
-            _open_checkout(cid, mid, plan)
+        if plan: _open_checkout(cid, mid, plan)
     elif data.startswith("paid:"):
+        if _premium_lock_screen(cid, mid): return
         plan = PLANS.get(data.split(":", 1)[1])
-        if not plan:
+        if not plan: return
+        attempts = _bump_utr_attempt(cid)
+        if attempts > 3:
+            _clear_flow(cid)
+            left = fmt_td(int(_utr_lock_until(cid) - time.time()))
+            desk_edit(
+                cid, mid,
+                f"Bhai bahut UTR maara. Premium section 1 ghante ke liye lock. {_e(left)} baad aana.",
+                kb=back_kb(),
+            )
             return
         flow[cid] = {"mode": "WAITING_FOR_UTR", "plan": plan["id"]}
         send_msg(
             cid,
-            f"<b>{_e(plan['name'])}</b> · ₹{plan['amount']}\n\n"
-            "Send the 12-digit UTR from your UPI app. Digits only.",
+            f"<b>{_e(plan['name'])}</b> · ₹{plan['amount']}\n\nUPI app se 12 digit UTR bhej. Sirf digits.",
             kb=back_kb(),
         )
-    elif data == "spin":
-        _run_spin(cid)
+    elif data == "spin": _run_spin(cid)
     elif data.startswith("cast:"):
-        if cid != ADMIN_ID:
-            return
+        if cid != ADMIN_ID: return
         audience = "prem" if data.endswith("prem") else "all"
-        label = "Premium members only" if audience == "prem" else "every member"
         flow[cid] = {"mode": "WAITING_FOR_BROADCAST", "audience": audience}
-        edit_msg(cid, mid, f"Send the next message. It will go to <b>{label}</b>.\n\n/cancel aborts this.")
+        who = "sirf Premium wale" if audience == "prem" else "har member"
+        desk_edit(cid, mid, f"Agle message bhej. Ye <b>{who}</b> ke paas jayega.\n\n/cancel se ye band.")
     elif data.startswith("pg:"):
         page = int(data.split(":")[1])
-        with _sl:
-            sess = user_sessions.get(cid)
+        with _sl: sess = user_sessions.get(cid)
         if sess and 0 <= page < len(sess["results"]):
             edit_msg(cid, mid, format_card(sess["results"][page], sess["query"]), kb=result_kb(page, len(sess["results"])))
     elif data.startswith("html:"):
         page = int(data.split(":")[1])
         with _sl:
             sess = user_sessions.get(cid)
-            row = None
-            query = ""
+            row = query = None
             if sess and 0 <= page < len(sess["results"]):
-                row = sess["results"][page]
-                query = sess["query"]
-        if row is not None:
-            send_html_doc(cid, row, query)
-    elif data == "noop":
-        return
+                row, query = sess["results"][page], sess["query"]
+        if row is not None: send_html_doc(cid, row, query)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MESSAGE HANDLER
-# ═══════════════════════════════════════════════════════════════════════════════
 def _start_payload(text: str) -> str | None:
     head, _, rest = text.partition(" ")
-    if not head.startswith("/start"):
-        return None
-    return rest.strip()
+    return rest.strip() if head.startswith("/start") else None
 
 def handle_msg(msg: dict) -> None:
-    cid   = msg["chat"]["id"]
-    raw   = msg.get("text", "").strip()
-    name  = msg.get("from", {}).get("first_name", "User")
-    un    = msg.get("from", {}).get("username", "")
+    cid, raw = msg["chat"]["id"], msg.get("text", "").strip()
+    name, un = msg.get("from", {}).get("first_name", "User"), msg.get("from", {}).get("username", "")
 
     with _sl:
-        _get_ud(cid, name=name, username=un)
+        user = _get_ud(cid, name=name, username=un)
 
     if cid == ADMIN_ID and msg.get("reply_to_message"):
-        src = msg["reply_to_message"].get("message_id")
-        target = support_routes.get(src)
+        target = support_routes.get(msg["reply_to_message"].get("message_id"))
         if target and raw:
-            send_msg(target, f"<b>Reply from the desk</b>\n\n{_e(raw)}")
-            send_msg(cid, "Delivered to the member.")
+            send_msg(target, f"<b>Desk se jawab</b>\n\n{_e(raw)}")
+            send_msg(cid, "Member ke paas pahunch gaya.")
             return
 
     state = flow.get(cid) or {}
@@ -1569,48 +1668,61 @@ def handle_msg(msg: dict) -> None:
     if cid == ADMIN_ID and mode == "WAITING_FOR_BROADCAST":
         if raw == "/cancel":
             _clear_flow(cid)
-            send_msg(cid, "Broadcast cancelled.")
+            send_msg(cid, "Broadcast cancel.")
             return
-        if raw.startswith("/"):
-            return
+        if raw.startswith("/"): return
         audience = state.get("audience") or "all"
         _clear_flow(cid)
-        send_msg(cid, "Sending now.")
+        send_msg(cid, "Bhej raha hoon.")
         threading.Thread(target=_broadcast, args=(audience, raw), daemon=True).start()
         return
 
     if cid == ADMIN_ID and raw == "/logs":
         admin_send_logs(cid)
         return
-
     if cid == ADMIN_ID and raw == "/admin":
         send_msg(cid, admin_stats_text())
         return
-
     if cid == ADMIN_ID and raw == "/broadcast":
         _clear_flow(cid)
-        send_msg(cid, "<b>Broadcast</b>\n\nWho should receive the next message you send?", kb=broadcast_kb())
+        send_msg(cid, "<b>Broadcast</b>\n\nAgle message kisko bheju?", kb=broadcast_kb())
+        return
+    if cid == ADMIN_ID and raw.startswith("/grant"):
+        _admin_grant(cid, raw)
+        return
+    if cid == ADMIN_ID and raw.startswith("/ban"):
+        _admin_ban(cid, raw)
+        return
+    if cid == ADMIN_ID and raw == "/csv":
+        admin_send_csv(cid)
+        return
+
+    if cid != ADMIN_ID and _banned(user):
+        send_msg(cid, _BAN_TEXT)
         return
 
     payload = _start_payload(raw)
     if payload is not None:
         _apply_referral(cid, payload)
-        if _guard_join(cid):
-            return
+        if _guard_join(cid): return
         _show_dashboard(cid)
         return
 
-    if raw.startswith("/"):
-        return
+    if raw.startswith("/"): return
 
     if mode == "WAITING_FOR_UTR":
+        if _utr_locked(cid):
+            left = fmt_td(int(_utr_lock_until(cid) - time.time()))
+            _clear_flow(cid)
+            send_msg(cid, f"Bhai Premium lock hai. {_e(left)} baad try kar.", kb=dashboard_kb())
+            return
         plan = PLANS.get(state.get("plan") or "")
         if not plan:
             _clear_flow(cid)
-            send_msg(cid, "That checkout expired. Open Premium and choose a term again.", kb=dashboard_kb())
+            send_msg(cid, "Woh checkout expire ho gaya. Premium khol ke term phir choose kar.", kb=dashboard_kb())
             return
         if not re.fullmatch(r"\d{12}", raw):
-            send_msg(cid, "The reference should be exactly 12 digits. Send only the UTR.")
+            send_msg(cid, "Reference exactly 12 digit ka hona chahiye. Sirf UTR bhej.")
             return
         with _sl:
             user = _get_ud(cid)
@@ -1618,60 +1730,49 @@ def handle_msg(msg: dict) -> None:
         payment_id = _store_payment(snapshot, plan, raw)
         _clear_flow(cid)
         if not payment_id:
-            send_msg(cid, "That UTR is already on file. If it was yours, wait for the operator — or write through Support.")
+            send_msg(cid, "Ye UTR pehle se file pe hai. Tera tha toh operator ka wait kar — warna Support pe likh.")
             return
         _forward_utr(snapshot, plan, raw, payment_id)
         return
 
     if mode == "WAITING_FOR_SUPPORT":
         _clear_flow(cid)
-        handle = f"@{un}" if un else "no username"
         note = (
-            "<b>Support note</b>\n\n"
-            f"From · {_e(name)} ({_e(handle)})\n"
-            f"ID · <code>{cid}</code>\n\n"
-            f"{_e(raw)}\n\n"
-            "<i>Reply to this message and the member will receive it.</i>"
+            f"<b>Support note</b>\n\n"
+            f"From · {_e(name)} ({'@'+un if un else 'username nahi'})\n"
+            f"ID · <code>{cid}</code>\n\n{_e(raw)}\n\n"
+            f"<i>Is message pe reply kar, member ko pahunch jayega.</i>"
         )
         admin_mid = send_msg(ADMIN_ID, note)
-        if admin_mid:
-            support_routes[admin_mid] = cid
-        send_msg(cid, "Your note is with the operator. Any reply will land here.", kb=dashboard_kb())
+        if admin_mid: support_routes[admin_mid] = cid
+        send_msg(cid, "Teri note operator ke paas hai. Jawab yahin aayega.", kb=dashboard_kb())
         return
 
-    if _guard_join(cid):
-        return
-
-    if _maybe_spin(cid, raw):
-        return
+    if _guard_join(cid): return
+    if _maybe_spin(cid, raw): return
 
     with _sl:
         is_active = cid in active_users
     if is_active:
-        send_msg(cid, "Your lookup is already on the desk. The result is on its way.")
+        send_msg(cid, "Arre ruk bhai, teri pehli search abhi desk pe hai.")
         return
-
     if not (raw.isdigit() and len(raw) == 10):
         send_msg(cid, get_text(cid, "invalid"), kb=back_kb())
         return
-
     _enqueue_search(cid, raw)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  LONG POLLING
+#  LONG POLLING & FASTAPI
 # ═══════════════════════════════════════════════════════════════════════════════
 def poll_telegram() -> None:
     try: requests.get(f"{BASE_URL}/deleteWebhook?drop_pending_updates=true", timeout=5)
     except: pass
-    offset: int | None = None
-    backoff: int = 1
-
+    offset, backoff = None, 1
     while True:
         try:
-            url  = f"{BASE_URL}/getUpdates?timeout=30" + (f"&offset={offset}" if offset else "")
+            url = f"{BASE_URL}/getUpdates?timeout=30" + (f"&offset={offset}" if offset else "")
             resp = requests.get(url, timeout=35).json()
-            if not resp.get("ok"):
-                time.sleep(backoff); backoff = min(backoff * 2, 60); continue
+            if not resp.get("ok"): time.sleep(backoff); backoff = min(backoff * 2, 60); continue
             backoff = 1
             for upd in resp.get("result", []):
                 offset = upd["update_id"] + 1
@@ -1679,16 +1780,11 @@ def poll_telegram() -> None:
                     if "callback_query" in upd: handle_cb(upd["callback_query"])
                     elif "message" in upd and "text" in upd["message"]: handle_msg(upd["message"])
                 except Exception: log.exception("Update handler crash")
-        except requests.RequestException:
-            time.sleep(backoff); backoff = min(backoff * 2, 60)
+        except requests.RequestException: time.sleep(backoff); backoff = min(backoff * 2, 60)
         except Exception: time.sleep(3)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  FASTAPI & STARTUP
-# ═══════════════════════════════════════════════════════════════════════════════
 @app.get("/")
-def health():
-    return {"status": "alive", "queue": _search_q.qsize()}
+def health(): return {"status": "alive", "queue": _search_q.qsize()}
 
-for _fn in [worker, poll_telegram, _broadcaster, _session_gc, _persist_loop]:
+for _fn in [worker, poll_telegram, _broadcaster, _session_gc, _persist_loop, _backup_loop]:
     threading.Thread(target=_fn, daemon=True).start()
