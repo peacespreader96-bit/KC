@@ -40,6 +40,8 @@ UPI_ID      = os.getenv("UPI_ID",     "admin@upi")
 USDT_BEP20  = os.getenv("USDT_BEP20", "0x0000000000000000000000000000000000000000")
 USDT_TRC20  = os.getenv("USDT_TRC20", "TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXx")
 BASE_HF     = "hf://buckets/CutehackX/icrm-hitek-full-db-mixed-bucket/"
+BASE_HF_UMBA = os.getenv("BASE_HF_UMBA", "hf://buckets/Khanenterprises/umba-bucket/")
+PARQUET_PARTS_UMBA = int(os.getenv("PARQUET_PARTS_UMBA", "7"))
 BASE_URL    = f"https://api.telegram.org/bot{TOKEN}"
 
 FORCE_CHANNELS: list[str] = []
@@ -131,6 +133,18 @@ if HF_TOKEN and HF_TOKEN != "hf_YOUR_READ_TOKEN_HERE":
 urls = [f"{BASE_HF}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS)]
 url_list = "[" + ", ".join(f"'{u}'" for u in urls) + "]"
 db.execute(f"CREATE VIEW people_phone AS SELECT * FROM read_parquet({url_list})")
+_umba_urls = [f"{BASE_HF_UMBA}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS_UMBA)]
+_umba_url_list = "[" + ", ".join(f"'{u}'" for u in _umba_urls) + "]"
+db.execute(f"""
+    CREATE VIEW people_umba AS
+    SELECT Number   AS phoneNumber,
+           Name     AS name,
+           Address  AS address,
+           Email    AS email,
+           Gender   AS gender,
+           Carrier  AS carrier
+    FROM   read_parquet({_umba_url_list})
+""")
 
 _db_lock = threading.Lock()
 log.info("✅ DuckDB ready")
@@ -142,8 +156,12 @@ def _to_dicts(conn: duckdb.DuckDBPyConnection) -> list[dict]:
 def db_search(number: str) -> list[dict]:
     sql = "SELECT * FROM people_phone WHERE phoneNumber = ? LIMIT 5"
     with _db_lock:
-        conn = db.execute(sql, [number])
-        return _to_dicts(conn)
+        return _to_dicts(db.execute(sql, [number]))
+
+def db_search_umba(number: str) -> list[dict]:
+    sql = "SELECT * FROM people_umba WHERE phoneNumber = ? LIMIT 5"
+    with _db_lock:
+        return _to_dicts(db.execute(sql, [number]))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SHARED STATE
@@ -1144,6 +1162,65 @@ def format_card(row: dict, query: str, elapsed: float | None = None) -> str:
     lines.append(_D)
     return "\n".join(lines)
 
+def format_card_combined(
+    row_main: dict | None, row_umba: dict | None,
+    query: str, elapsed: float | None = None
+) -> str:
+    lines = ["<b>Customer file · Combined</b>", "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄", f"🔎 <code>{_e(query)}</code>", ""]
+
+    lines.append("📁 <b>icrm-hitek</b>")
+    if row_main:
+        name         = sv(row_main.get("name"))
+        fathersName  = sv(row_main.get("fathersName"))
+        phoneNumber  = sv(row_main.get("phoneNumber"))
+        otherNumber  = sv(row_main.get("otherNumber"))
+        aadharNumber = sv(row_main.get("aadharNumber"))
+        address      = clean_addr(row_main.get("address"))
+        state        = sv(row_main.get("state"))
+        pincode      = sv(row_main.get("pincode"))
+        district     = sv(row_main.get("district"))
+        town         = sv(row_main.get("town"))
+        if name:         lines.append(f"  👤 <b>Naam</b>     ➡️ {_e(name)}")
+        if fathersName:  lines.append(f"  👨 <b>Father</b>   ➡️ {_e(fathersName)}")
+        if phoneNumber:  lines.append(f"  📱 <b>Number</b>   ➡️ {_spoiler(phoneNumber)}")
+        if otherNumber:  lines.append(f"  📞 <b>Dusra</b>    ➡️ {_spoiler(otherNumber)}")
+        if aadharNumber: lines.append(f"  🪪 <b>ID</b>        ➡️ {_spoiler(aadharNumber)}")
+        if address:      lines.append(f"  🏠 <b>Address</b>\n<blockquote expandable>{_e(address)}</blockquote>")
+        loc = ", ".join(x for x in [town, district, state] if x)
+        if loc:          lines.append(f"  📍 <b>Location</b> ➡️ {_e(loc)}")
+        if pincode:      lines.append(f"  📮 <b>Zip</b>       ➡️ <code>{_e(pincode)}</code>")
+    else:
+        lines.append("  <i>Kuch nahi mila</i>")
+
+    lines.append("")
+    lines.append("┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
+    lines.append("")
+
+    lines.append("📂 <b>Umba</b>")
+    if row_umba:
+        u_phone   = sv(row_umba.get("phoneNumber"))
+        u_name    = sv(row_umba.get("name"))
+        u_address = clean_addr(row_umba.get("address"))
+        u_email   = sv(row_umba.get("email"))
+        u_gender  = sv(row_umba.get("gender"))
+        u_carrier = sv(row_umba.get("carrier"))
+        if u_name:    lines.append(f"  👤 <b>Naam</b>    ➡️ {_e(u_name)}")
+        if u_phone:   lines.append(f"  📱 <b>Number</b>  ➡️ {_spoiler(u_phone)}")
+        if u_address: lines.append(f"  🏠 <b>Address</b>\n<blockquote expandable>{_e(u_address)}</blockquote>")
+        if u_email:   lines.append(f"  📧 <b>Email</b>   ➡️ {_spoiler(u_email)}")
+        if u_gender:  lines.append(f"  🧬 <b>Gender</b>  ➡️ {_e(u_gender)}")
+        if u_carrier: lines.append(f"  📡 <b>Carrier</b> ➡️ {_e(u_carrier)}")
+    else:
+        lines.append("  <i>Kuch nahi mila</i>")
+
+    lines += ["", f"🕰 {ts_str()}"]
+    if elapsed is not None:
+        lines.append(f"⚡ Speed: {elapsed_label(elapsed)}")
+        if elapsed < 1.0:
+            lines.append("🏎️ BHAI YE TOH ROCKET THA")
+    lines.append(_D)
+    return "\n".join(lines)
+
 _HTML_CSS = """
 :root { --ink:#16130f; --paper:#f7f1e6; --gold:#8a6d3b; --line:#e0d3bf; --mute:#6e6458; }
 * { box-sizing: border-box; }
@@ -1186,6 +1263,48 @@ def generate_html(row: dict, query: str) -> str:
     memo = f"{_e(BOT_NAME)} ne ye note directory se nikala. Private file hai. Rakh le, ya phaad de — teri marzi."
     title = sv(row.get("name")) or f"Note for {query}"
     return _html_page(title, f"{BOT_NAME} · Customer file", pairs, memo)
+
+def generate_html_combined(row_main: dict | None, row_umba: dict | None, query: str) -> str:
+    pairs: list[tuple[str, str]] = [("Query", f"<code>{_e(query)}</code>")]
+
+    pairs.append(("📁 Source", "<b>icrm-hitek</b>"))
+    if row_main:
+        address = clean_addr(row_main.get("address"))
+        loc = ", ".join(x for x in [sv(row_main.get("town")), sv(row_main.get("district")), sv(row_main.get("state"))] if x)
+        for label, val in [
+            ("Naam",       _e(sv(row_main.get("name")))),
+            ("Father",     _e(sv(row_main.get("fathersName")))),
+            ("Number",     _e(sv(row_main.get("phoneNumber")))),
+            ("Alt Number", _e(sv(row_main.get("otherNumber")))),
+            ("ID",         _e(sv(row_main.get("aadharNumber")))),
+            ("Address",    _e(address)),
+            ("Location",   _e(loc)),
+            ("Zip",        _e(sv(row_main.get("pincode")))),
+        ]:
+            if val:
+                pairs.append((label, val))
+    else:
+        pairs.append(("Status", "<i>No record found</i>"))
+
+    pairs.append(("📂 Source", "<b>Umba</b>"))
+    if row_umba:
+        u_addr = clean_addr(row_umba.get("address"))
+        for label, val in [
+            ("Naam",    _e(sv(row_umba.get("name")))),
+            ("Number",  _e(sv(row_umba.get("phoneNumber")))),
+            ("Address", _e(u_addr)),
+            ("Email",   _e(sv(row_umba.get("email")))),
+            ("Gender",  _e(sv(row_umba.get("gender")))),
+            ("Carrier", _e(sv(row_umba.get("carrier")))),
+        ]:
+            if val:
+                pairs.append((label, val))
+    else:
+        pairs.append(("Status", "<i>No record found</i>"))
+
+    memo = f"{_e(BOT_NAME)} ne ye dono directories se nikala. Private file hai. Rakh le, ya phaad de."
+    name = sv((row_main or {}).get("name")) or sv((row_umba or {}).get("name")) or f"Note for {query}"
+    return _html_page(name, f"{BOT_NAME} · Combined file", pairs, memo)
 
 def generate_receipt_html(user: dict, plan: dict, when: str, expiry: str, utr: str = "", gateway: str = "", invoice_id: str = "") -> str:
     pairs = [
@@ -2638,31 +2757,52 @@ def worker() -> None:
                     edit_msg(item["chat_id"], item["msg_id"], msg_queue(i, item["query"]))
                 except Exception:
                     pass
+
             edit_msg(cid, mid, msg_searching(query))
             for label in _next_load_stages():
                 time.sleep(_STAGE_GAP)
                 edit_msg(cid, mid, msg_stage(query, label))
+
             t_db = time.monotonic()
-            rows = db_search(query)
+            rows_main = db_search(query)
+            rows_umba = db_search_umba(query)
             elapsed = time.monotonic() - t_db
+
             with _sl:
                 global_stats["searches"] += 1
                 if cid in user_data:
                     user_data[cid]["searches"] += 1
-            if not rows:
+
+            total = max(len(rows_main), len(rows_umba))
+
+            if total == 0:
                 with _sl:
                     _remember(cid, query, 0)
                 edit_msg(cid, mid, msg_no_result(query), kb=back_kb())
             else:
+                found = len(rows_main) + len(rows_umba)
                 with _sl:
-                    global_stats["results"] += len(rows)
+                    global_stats["results"] += found
                     if cid in user_data:
-                        user_data[cid]["results"] += len(rows)
-                    user_sessions[cid] = {"results": rows, "page": 0, "query": query, "ts": time.time()}
-                    _remember(cid, query, len(rows))
+                        user_data[cid]["results"] += found
+                    _remember(cid, query, found)
+                    user_sessions[cid] = {
+                        "results":      rows_main,
+                        "results_umba": rows_umba,
+                        "page":         0,
+                        "query":        query,
+                        "ts":           time.time(),
+                    }
+                row_main = rows_main[0] if rows_main else None
+                row_umba = rows_umba[0] if rows_umba else None
                 edit_msg(cid, mid, msg_stage(query, "✅ Match mil gaya!"))
                 time.sleep(0.35)
-                edit_msg(cid, mid, format_card(rows[0], query, elapsed), kb=result_kb(0, len(rows)))
+                edit_msg(
+                    cid, mid,
+                    format_card_combined(row_main, row_umba, query, elapsed),
+                    kb=result_kb(0, total),
+                )
+
         except Exception:
             log.exception("Worker error")
             edit_msg(cid, mid, "⚠️ Bhai desk phat gaya is lookup pe. Thodi der ruk, phir try kar.")
@@ -3123,18 +3263,41 @@ def handle_cb(cb: dict) -> None:
         page = int(data.split(":")[1])
         with _sl:
             sess = user_sessions.get(cid)
-        if sess and 0 <= page < len(sess["results"]):
-            edit_msg(cid, mid, format_card(sess["results"][page], sess["query"]),
-                     kb=result_kb(page, len(sess["results"])))
+        if sess:
+            rows_main = sess.get("results", [])
+            rows_umba = sess.get("results_umba", [])
+            total = max(len(rows_main), len(rows_umba))
+            if 0 <= page < total:
+                row_main = rows_main[page] if page < len(rows_main) else None
+                row_umba = rows_umba[page] if page < len(rows_umba) else None
+                edit_msg(
+                    cid, mid,
+                    format_card_combined(row_main, row_umba, sess["query"]),
+                    kb=result_kb(page, total),
+                )
+
     elif data.startswith("html:"):
         page = int(data.split(":")[1])
         with _sl:
             sess = user_sessions.get(cid)
-            row = query = None
-            if sess and 0 <= page < len(sess["results"]):
-                row, query = sess["results"][page], sess["query"]
-        if row is not None:
-            send_html_doc(cid, row, query)
+        if sess:
+            rows_main = sess.get("results", [])
+            rows_umba = sess.get("results_umba", [])
+            row_main = rows_main[page] if page < len(rows_main) else None
+            row_umba = rows_umba[page] if page < len(rows_umba) else None
+            query = sess["query"]
+            if row_main is not None or row_umba is not None:
+                phone = (
+                    sv((row_main or {}).get("phoneNumber"))
+                    or sv((row_umba or {}).get("phoneNumber"))
+                    or "note"
+                )
+                send_html_file(
+                    cid,
+                    f"{BOT_NAME}_Report_{phone}.html",
+                    generate_html_combined(row_main, row_umba, query),
+                    "📄 Le bhai, combined directory note attach hai.",
+                )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  COMMAND DISPATCH
