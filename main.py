@@ -133,8 +133,7 @@ if HF_TOKEN and HF_TOKEN != "hf_YOUR_READ_TOKEN_HERE":
 urls = [f"{BASE_HF}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS)]
 url_list = "[" + ", ".join(f"'{u}'" for u in urls) + "]"
 db.execute(f"CREATE VIEW people_phone AS SELECT * FROM read_parquet({url_list})")
-_umba_urls = [f"{BASE_HF_UMBA}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS_UMBA)]
-_umba_url_list = "[" + ", ".join(f"'{u}'" for u in _umba_urls) + "]"
+
 db.execute(f"""
     CREATE VIEW people_umba AS
     SELECT Number   AS phoneNumber,
@@ -143,7 +142,7 @@ db.execute(f"""
            Email    AS email,
            Gender   AS gender,
            Carrier  AS carrier
-    FROM   read_parquet({_umba_url_list})
+    FROM   read_parquet('{BASE_HF_UMBA}idx_phone.*.parquet')
 """)
 
 _db_lock = threading.Lock()
