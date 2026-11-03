@@ -43,7 +43,6 @@ USDT_BEP20  = os.getenv("USDT_BEP20", "0x000000000000000000000000000000000000000
 USDT_TRC20  = os.getenv("USDT_TRC20", "TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXx")
 BASE_HF     = "hf://buckets/CutehackX/icrm-hitek-full-db-mixed-bucket/"
 BASE_HF_UMBA = os.getenv("BASE_HF_UMBA", "hf://buckets/Khanenterprises/umba-bucket/")
-PARQUET_PARTS_UMBA = int(os.getenv("PARQUET_PARTS_UMBA", "7"))
 BASE_URL    = f"https://api.telegram.org/bot{TOKEN}"
 
 FORCE_CHANNELS: list[str] = []
@@ -76,7 +75,6 @@ MAX_QUEUE          = 15
 SESSION_TTL        = 1800
 QUEUE_BROADCAST_IV = 5
 GC_INTERVAL        = 300
-PARQUET_PARTS      = 7
 _STAGE_GAP         = 0.30
 _PAY_TTL           = 1800
 _ROLES_ASSIGNABLE  = ("FINANCE_MANAGER", "SUPPORT_AGENT", "USER")
@@ -140,24 +138,8 @@ db.execute("INSTALL httpfs; LOAD httpfs;")
 if HF_TOKEN and HF_TOKEN != "hf_YOUR_READ_TOKEN_HERE":
     db.execute(f"CREATE SECRET (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
 
-urls = [f"{BASE_HF}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS)]
-url_list = "[" + ", ".join(f"'{u}'" for u in urls) + "]"
-db.execute(f"CREATE VIEW people_phone AS SELECT * FROM read_parquet({url_list})")
-
 try:
-    urls_u = [f"{BASE_HF_UMBA}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS_UMBA)]
-    url_list_u = "[" + ", ".join(f"'{u}'" for u in urls_u) + "]"
-    db.execute(f"""
-        CREATE VIEW people_umba AS
-        SELECT Number   AS phoneNumber,
-               Name     AS name,
-               Address  AS address,
-               Email    AS email,
-               Gender   AS gender,
-               Carrier  AS carrier
-        FROM   read_parquet({url_list_u})
-    """)
-except Exception:
+    db.execute(f"CREATE VIEW people_phone AS SELECT * FROM read_parquet('{BASE_HF}idx_phone.*.parquet')")
     db.execute(f"""
         CREATE VIEW people_umba AS
         SELECT Number   AS phoneNumber,
@@ -168,9 +150,11 @@ except Exception:
                Carrier  AS carrier
         FROM   read_parquet('{BASE_HF_UMBA}idx_phone.*.parquet')
     """)
+    log.info("✅ DuckDB ready with multi-source views (Glob)")
+except Exception as e:
+    log.error("DuckDB view init failed: %s", e)
 
 _db_lock = threading.RLock()
-log.info("✅ DuckDB ready with multi-source views")
 
 def _to_dicts(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     cols = [d[0] for d in conn.description]
