@@ -2,6 +2,8 @@
 """
 KaramChand OSINT Telegram Bot · Enterprise Edition
 FastAPI + DuckDB (httpfs/HuggingFace) + Long Polling + SQLite members
+Optimized for ultra-fast multi-source lookups, streamlined Telegram inline UI,
+and anonymized intelligence data sources (KC-SOURCE-01, KC-SOURCE-02).
 """
 
 import csv
@@ -75,7 +77,7 @@ SESSION_TTL        = 1800
 QUEUE_BROADCAST_IV = 5
 GC_INTERVAL        = 300
 PARQUET_PARTS      = 7
-_STAGE_GAP         = 0.45
+_STAGE_GAP         = 0.30
 _PAY_TTL           = 1800
 _ROLES_ASSIGNABLE  = ("FINANCE_MANAGER", "SUPPORT_AGENT", "USER")
 _PAY_MODES         = {"checkout", "WAITING_FOR_UTR", "WAITING_FOR_TX", "stars", "pay_choose", "crypto"}
@@ -92,6 +94,14 @@ _RECEIPT_DIR = os.path.join(_HERE, "receipts")
 _BAN_TEXT    = "Bhai tera ID ban hai. Koi feature nahi chalega — desk band. Operator se baat kar, yahan rona band."
 _MAINT_TEXT  = "Bhai system maintenance mein hai, thodi der baad aana."
 MAINTENANCE  = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HTTP CONNECTION POOLING (High-speed requests to Telegram)
+# ═══════════════════════════════════════════════════════════════════════════════
+_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=25, pool_maxsize=50, max_retries=1)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LOGGING  ·  12-hour clock
@@ -125,7 +135,7 @@ _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
 
 log.info("⏳ Initialising DuckDB connection …")
 db = duckdb.connect(config={"custom_user_agent": _UA})
-db.execute("SET memory_limit='200MB'; SET threads=1; SET http_timeout=10000;")
+db.execute("SET memory_limit='350MB'; SET threads=2; SET http_timeout=15000; SET enable_progress_bar=false;")
 db.execute("INSTALL httpfs; LOAD httpfs;")
 if HF_TOKEN and HF_TOKEN != "hf_YOUR_READ_TOKEN_HERE":
     db.execute(f"CREATE SECRET (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
@@ -134,19 +144,33 @@ urls = [f"{BASE_HF}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS)]
 url_list = "[" + ", ".join(f"'{u}'" for u in urls) + "]"
 db.execute(f"CREATE VIEW people_phone AS SELECT * FROM read_parquet({url_list})")
 
-db.execute(f"""
-    CREATE VIEW people_umba AS
-    SELECT Number   AS phoneNumber,
-           Name     AS name,
-           Address  AS address,
-           Email    AS email,
-           Gender   AS gender,
-           Carrier  AS carrier
-    FROM   read_parquet('{BASE_HF_UMBA}idx_phone.*.parquet')
-""")
+try:
+    urls_u = [f"{BASE_HF_UMBA}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS_UMBA)]
+    url_list_u = "[" + ", ".join(f"'{u}'" for u in urls_u) + "]"
+    db.execute(f"""
+        CREATE VIEW people_umba AS
+        SELECT Number   AS phoneNumber,
+               Name     AS name,
+               Address  AS address,
+               Email    AS email,
+               Gender   AS gender,
+               Carrier  AS carrier
+        FROM   read_parquet({url_list_u})
+    """)
+except Exception:
+    db.execute(f"""
+        CREATE VIEW people_umba AS
+        SELECT Number   AS phoneNumber,
+               Name     AS name,
+               Address  AS address,
+               Email    AS email,
+               Gender   AS gender,
+               Carrier  AS carrier
+        FROM   read_parquet('{BASE_HF_UMBA}idx_phone.*.parquet')
+    """)
 
-_db_lock = threading.Lock()
-log.info("✅ DuckDB ready")
+_db_lock = threading.RLock()
+log.info("✅ DuckDB ready with multi-source views")
 
 def _to_dicts(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     cols = [d[0] for d in conn.description]
@@ -154,13 +178,25 @@ def _to_dicts(conn: duckdb.DuckDBPyConnection) -> list[dict]:
 
 def db_search(number: str) -> list[dict]:
     sql = "SELECT * FROM people_phone WHERE phoneNumber = ? LIMIT 5"
-    with _db_lock:
-        return _to_dicts(db.execute(sql, [number]))
+    try:
+        cur = db.cursor()
+        res = _to_dicts(cur.execute(sql, [number]))
+        cur.close()
+        return res
+    except Exception:
+        with _db_lock:
+            return _to_dicts(db.execute(sql, [number]))
 
 def db_search_umba(number: str) -> list[dict]:
     sql = "SELECT * FROM people_umba WHERE phoneNumber = ? LIMIT 5"
-    with _db_lock:
-        return _to_dicts(db.execute(sql, [number]))
+    try:
+        cur = db.cursor()
+        res = _to_dicts(cur.execute(sql, [number]))
+        cur.close()
+        return res
+    except Exception:
+        with _db_lock:
+            return _to_dicts(db.execute(sql, [number]))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SHARED STATE
@@ -189,7 +225,8 @@ def _init_sqlite() -> None:
         _sql.executescript(
             """
             PRAGMA journal_mode=WAL;
-            PRAGMA busy_timeout=3000;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS users (
                 chat_id          INTEGER PRIMARY KEY,
                 name             TEXT,
@@ -621,13 +658,13 @@ def _q_pos(cid: int) -> int:
     return 0
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TELEGRAM API
+#  TELEGRAM API (Reusing persistent HTTP pool)
 # ═══════════════════════════════════════════════════════════════════════════════
 def tg(method: str, payload: dict, *, retries: int = 2) -> dict:
     url = f"{BASE_URL}/{method}"
     for attempt in range(retries + 1):
         try:
-            res = requests.post(url, json=payload, timeout=10)
+            res = _session.post(url, json=payload, timeout=10)
             data = res.json()
             if not data.get("ok"):
                 desc = str(data.get("description") or "")
@@ -643,7 +680,7 @@ def tg(method: str, payload: dict, *, retries: int = 2) -> dict:
             if attempt == retries:
                 log.error("TG/%s failed (%d retries): %s", method, retries, exc)
                 return {}
-            time.sleep(0.4 * (attempt + 1))
+            time.sleep(0.3 * (attempt + 1))
     return {}
 
 def send_msg(cid: int, text: str, kb=None) -> int | None:
@@ -696,7 +733,7 @@ def answer_cb(cb_id: str, text: str | None = None, alert: bool = False) -> None:
 
 def send_html_file(cid: int, filename: str, content: str, caption: str) -> None:
     try:
-        requests.post(
+        _session.post(
             f"{BASE_URL}/sendDocument",
             data={"chat_id": cid, "caption": caption, "parse_mode": "HTML"},
             files={"document": (filename, io.BytesIO(content.encode("utf-8")), "text/html")},
@@ -711,7 +748,7 @@ def _download_tg_file(file_id: str) -> bytes | None:
     if not path:
         return None
     try:
-        res = requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{path}", timeout=120)
+        res = _session.get(f"https://api.telegram.org/file/bot{TOKEN}/{path}", timeout=120)
         return res.content if res.status_code == 200 else None
     except Exception:
         log.exception("telegram file download failed")
@@ -925,7 +962,7 @@ def _blocked_maint(cid: int) -> bool:
     send_msg(cid, _MAINT_TEXT); return True
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  UI DICTIONARY & KEYBOARDS
+#  UI DICTIONARY & KEYBOARDS (Polished & Organized)
 # ═══════════════════════════════════════════════════════════════════════════════
 T = {
     "en": {
@@ -942,48 +979,66 @@ def get_text(cid: int, key: str) -> str:
 
 def dashboard_kb():
     return [
-        [{"text": "👤 Mera Scene", "callback_data": "profile"}, {"text": "👑 Premium", "callback_data": "premium"}],
-        [{"text": "📜 Purani Search", "callback_data": "history"}, {"text": "🆘 Support", "callback_data": "support"}],
         [{"text": "🔍 Number Daal", "callback_data": "search"}],
+        [{"text": "👤 Mera Scene", "callback_data": "profile"}, {"text": "👑 Premium Pass", "callback_data": "premium"}],
+        [{"text": "📜 Purani Search", "callback_data": "history"}, {"text": "🎰 Lucky Spin", "callback_data": "spin"}],
+        [{"text": "🆘 Support", "callback_data": "support"}, {"text": "ℹ️ Help", "callback_data": "help"}],
     ]
 
 def main_kb(): return dashboard_kb()
-def back_kb(): return [[{"text": "Wapas", "callback_data": "dashboard"}]]
+
+def back_kb():
+    return [
+        [{"text": "🔍 Nayi Search", "callback_data": "search"}, {"text": "🔙 Wapas", "callback_data": "dashboard"}]
+    ]
 
 def pricing_kb():
-    rows = [[{"text": f"{p['name']} · ₹{p['amount']}", "callback_data": f"plan:{pid}"}] for pid, p in _plans().items()]
-    rows.append([{"text": "Wapas", "callback_data": "dashboard"}])
+    rows = [
+        [{"text": f"⚡ {p['name']} · ₹{p['amount']}", "callback_data": f"plan:{pid}"}]
+        for pid, p in _plans().items()
+    ]
+    rows.append([{"text": "🔙 Wapas", "callback_data": "dashboard"}])
     return rows
 
 def _gateway_kb(plan_id: str):
     rows = []
-    if _gw_on("upi"): rows.append([{"text": "UPI manual", "callback_data": f"gwpay:upi:{plan_id}"}])
-    if _gw_on("stars"): rows.append([{"text": "Telegram Stars", "callback_data": f"gwpay:stars:{plan_id}"}])
-    if _gw_on("crypto"): rows.append([{"text": "Crypto USDT", "callback_data": f"gwpay:crypto:{plan_id}"}])
-    rows.append([{"text": "Payment chhod", "callback_data": "paycancel"}, {"text": "Wapas", "callback_data": "premium"}])
+    if _gw_on("upi"): rows.append([{"text": "💳 UPI Instant", "callback_data": f"gwpay:upi:{plan_id}"}])
+    if _gw_on("stars"): rows.append([{"text": "⭐ Telegram Stars", "callback_data": f"gwpay:stars:{plan_id}"}])
+    if _gw_on("crypto"): rows.append([{"text": "💎 Crypto USDT", "callback_data": f"gwpay:crypto:{plan_id}"}])
+    rows.append([{"text": "❌ Cancel", "callback_data": "paycancel"}, {"text": "🔙 Wapas", "callback_data": "premium"}])
     return rows
 
 def result_kb(page: int, total: int):
-    nav = []
-    if page > 0: nav.append({"text": "◀️ Pichla", "callback_data": f"pg:{page - 1}"})
-    if total > 1: nav.append({"text": f"📄 {page + 1}/{total}", "callback_data": "noop"})
-    if page < total - 1: nav.append({"text": "Agla ▶️", "callback_data": f"pg:{page + 1}"})
-    rows = [nav] if nav else []
-    rows.append([{"text": "📄 HTML Report", "callback_data": f"html:{page}"}])
-    rows.append([{"text": "Wapas", "callback_data": "dashboard"}])
+    rows = []
+    if total > 1:
+        nav = []
+        if page > 0:
+            nav.append({"text": "◀️ Pichla", "callback_data": f"pg:{page - 1}"})
+        nav.append({"text": f"📄 {page + 1}/{total}", "callback_data": "noop"})
+        if page < total - 1:
+            nav.append({"text": "Agla ▶️", "callback_data": f"pg:{page + 1}"})
+        rows.append(nav)
+    rows.append([
+        {"text": "📄 Download Report", "callback_data": f"html:{page}"},
+        {"text": "🔍 Nayi Search", "callback_data": "new_search"},
+    ])
+    rows.append([
+        {"text": "🏠 Main Menu", "callback_data": "dashboard"},
+        {"text": "👑 Premium", "callback_data": "premium"},
+    ])
     return rows
 
 def force_kb():
     rows = []
     for ch in FORCE_CHANNELS:
         link = _channel_link(str(ch))
-        if link: rows.append([{"text": f"Join kar {ch}", "url": link}])
-        else: rows.append([{"text": f"Join kar {ch}", "callback_data": "noop"}])
-    rows.append([{"text": "Check kar ✅", "callback_data": "verify"}])
+        if link: rows.append([{"text": f"Join {ch} ↗", "url": link}])
+        else: rows.append([{"text": f"Join {ch}", "callback_data": "noop"}])
+    rows.append([{"text": "Verify Join ✅", "callback_data": "verify"}])
     return rows
 
 def broadcast_kb():
-    return [[{"text": "Sabko", "callback_data": "cast:all"}, {"text": "Sirf Premium", "callback_data": "cast:prem"}]]
+    return [[{"text": "📢 Sabko Bhej", "callback_data": "cast:all"}, {"text": "👑 Sirf Premium", "callback_data": "cast:prem"}]]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MESSAGE TEMPLATES
@@ -995,49 +1050,52 @@ def msg_dashboard(u: dict) -> str:
         return (
             f"👑 <b>Waapas aa gaya, {name}?</b>\n\n"
             f"Kya scene hai bhai? Bata kis customer ki info chahiye.\n\n"
-            f"Premium desk khula hai. Membership <b>{_e(until)}</b> tak chalegi.\n\n{_D}"
+            f"⚡ <b>Status:</b> Premium Active\n"
+            f"⏳ <b>Validity:</b> <b>{_e(until)}</b>\n\n{_D}"
         )
     used = _daily_used(u)
     allowance = _free_limit() + _bonus_today(int(u["id"]))
     left = max(0, allowance - used)
-    extra = " Aaj ke spin wale extra pulls bhi count ho rahe hain.\n\n" if _bonus_today(int(u["id"])) else ""
+    extra = " (Lucky spin bonus included)" if _bonus_today(int(u["id"])) else ""
     return (
         f"<b>Kya scene hai bhai, {name}?</b>\n\n"
-        f"Bata kis customer ki info chahiye. 10 digit number daal, ya neeche se choose kar.\n\n"
-        f"Aaj ke free lookups bache · <b>{left}</b> of {allowance}.\n{extra}\n{_D}"
+        f"Bata kis customer ki info chahiye. 10 digit number daal, ya neeche button se start kar.\n\n"
+        f"📊 <b>Aaj ke free lookups:</b> <b>{left}</b> / {allowance}{extra}\n\n{_D}"
     )
 
 def msg_profile(u: dict) -> str:
     gold = _premium_active(u)
     used = _daily_used(u)
     bonus = _bonus_today(int(u["id"]))
-    allowance = "Unlimited" if (gold or int(u["id"]) == ADMIN_ID) else f"{max(0, _free_limit() + bonus - used)} aaj bache"
+    allowance = "Unlimited 👑" if (gold or int(u["id"]) == ADMIN_ID) else f"{max(0, _free_limit() + bonus - used)} bache"
     if gold: status = f"👑 Premium · {_e(fmt_until(float(u.get('premium_until') or 0)))} tak"
-    elif int(u["id"]) == ADMIN_ID: status = "Operator · lookups unlimited"
-    else: status = "Free wala desk"
+    elif int(u["id"]) == ADMIN_ID: status = "⚡ Operator · Lookups unlimited"
+    else: status = "Free Desk"
     handle = f"@{_e(u['username'])}\n" if u.get("username") else ""
     link = f"{BOT_LINK}?start=ref_{u['id']}"
     streak = int(u.get("streak_count") or 0)
     role = _e(str(u.get("role") or "USER"))
     return (
-        f"{'👑 ' if gold else ''}<b>{_e(u.get('name') or 'Bhai')}</b>\n"
-        f"{handle}ID · <code>{u['id']}</code>\nRole · {role}\nStatus · {status}\n\n"
-        f"Lookups · <b>{int(u.get('searches') or 0)}</b>\n"
-        f"Aaj · <b>{_e(str(allowance))}</b>\n"
-        f"Streak · <b>{streak}</b> / {STREAK_INTERVAL}\n"
-        f"Invites · <b>{int(u.get('referral_count') or 0)}</b>\n\n"
-        f"Paanch log tere link se aaye toh ek din premium pakka.\n"
-        f"<code>{_e(link)}</code>\n\n{_D}"
+        f"{'👑 ' if gold else '👤 '}<b>{_e(u.get('name') or 'Bhai')}</b>\n"
+        f"{handle}🆔 <code>{u['id']}</code>\n"
+        f"🔰 Role: <b>{role}</b>\n"
+        f"⭐ Plan: <b>{status}</b>\n\n"
+        f"🔍 Total Searches: <b>{int(u.get('searches') or 0)}</b>\n"
+        f"📊 Aaj ki limit: <b>{_e(str(allowance))}</b>\n"
+        f"🔥 Streak: <b>{streak}</b> / {STREAK_INTERVAL}\n"
+        f"👥 Referrals: <b>{int(u.get('referral_count') or 0)}</b>\n\n"
+        f"💡 <i>5 logon ko invite kar ke 1 din ka premium free le!</i>\n"
+        f"🔗 <code>{_e(link)}</code>\n\n{_D}"
     )
 
 def msg_history(u: dict) -> str:
     hist = list(u.get("history") or [])[-10:]
     if not hist:
-        return f"<b>History</b>\n\nAbhi kuch file nahi hui bhai.\n\n{_D}"
-    lines = ["<b>Pichli lookups</b>", ""]
+        return f"<b>📜 Search History</b>\n\nAbhi tak koi search nahi hui bhai.\n\n{_D}"
+    lines = ["<b>📜 Pichli Search Records</b>", ""]
     for item in reversed(hist):
         found = item.get("found")
-        tag = "koi match nahi" if found == 0 else ("1 match" if found == 1 else f"{found} matches" if isinstance(found, int) else "file ho gayi")
+        tag = "❌ 0 match" if found == 0 else (f"✅ {found} match{'es' if found != 1 else ''}" if isinstance(found, int) else "✅ Done")
         lines.append(f"• <code>{_e(str(item.get('query', '')))}</code> · {_e(str(item.get('at', '')))} · {tag}")
     lines += ["", _D]
     return "\n".join(lines)
@@ -1045,79 +1103,83 @@ def msg_history(u: dict) -> str:
 def msg_pricing(u: dict) -> str:
     if _utr_locked(int(u["id"])):
         left = fmt_td(int(_utr_lock_until(int(u["id"])) - time.time()))
-        return f"<b>Premium lock hai bhai.</b>\n\nUTR spam ka natija. {_e(left)} baad aana.\n\n{_D}"
+        return f"<b>⚠️ Premium locked</b>\n\nZyada invalid UTR attempts ki wajah se locked hai. {_e(left)} baad aana.\n\n{_D}"
     gates = []
     if _gw_on("upi"): gates.append("UPI")
     if _gw_on("stars"): gates.append("Stars")
     if _gw_on("crypto"): gates.append("Crypto")
-    gate_line = ", ".join(gates) if gates else "koi gateway on nahi"
+    gate_line = ", ".join(gates) if gates else "Temporarily unavailable"
     if _premium_active(u):
         head = (
-            f"👑 <b>Premium on hai</b> {_e(fmt_until(float(u.get('premium_until') or 0)))} tak.\n\n"
-            f"Extend karna ho toh kar le. Rasta: {gate_line}."
+            f"👑 <b>Premium Active Hai!</b>\n"
+            f"Expiry: <b>{_e(fmt_until(float(u.get('premium_until') or 0)))}</b>\n\n"
+            f"Extend karna ho toh neeche se pass choose kar.\nPayment Options: <b>{gate_line}</b>."
         )
     else:
         head = (
-            "<b>Premium membership</b>\n\n"
-            "Unlimited lookups, gold desk, aur line mein thodi izzat. "
-            f"Rasta: {gate_line}. Operator ya Telegram confirm karega, phir memo aayega."
+            "👑 <b>KaramChand Premium Pass</b>\n\n"
+            "• Unlimited Lookups bina kisi rukawat ke\n"
+            "• High priority queue execution\n"
+            "• Multi-source combined reports & HTML downloads\n\n"
+            f"Supported Payments: <b>{gate_line}</b>"
         )
-    return f"{head}\n\nTerm choose kar.\n\n{_D}"
+    return f"{head}\n\nApna pass choose kar:\n\n{_D}"
 
 def msg_support_prompt() -> str:
     return (
-        f"<b>Support</b>\n\n"
-        f"Agle message ko aise likh jaise insaan ko likhta hai. Ticket banega, agent claim karega, jawab yahin aayega.\n\n{_D}"
+        f"🆘 <b>KaramChand Desk Support</b>\n\n"
+        f"Apni dikkat ya sawal neeche likh kar bhej. Direct ticket banega aur support team reply karegi.\n\n{_D}"
     )
 
 def msg_force() -> str:
-    lines = ["<b>Pehle ye ek kaam kar</b>", "", "Neeche wale channels join kar, phir check daba. Bina membership ke lookup nahi chalega.", ""]
+    lines = ["<b>⚠️ Channel Join Required</b>", "", "Bot use karne ke liye neeche diye gaye channels join karna zaroori hai:", ""]
     for ch in FORCE_CHANNELS:
         lines.append(f"• {_e(str(ch))}")
-    lines += ["", _D]
+    lines += ["", "Join karne ke baad <b>Verify Join ✅</b> daba.", "", _D]
     return "\n".join(lines)
 
 def msg_help() -> str:
     return (
-        f"ℹ️ <b>Desk kaise chalti hai</b>\n\n"
-        f"10 digit customer number bhej. Free walon ke {_free_limit()} lookups roz. Premium pe cap hat jaata hai.\n\n"
-        f"Number aur ID chhupe aate hain. Tap karke khol.\n\n{_D}"
+        f"ℹ️ <b>KaramChand Help & Instructions</b>\n\n"
+        f"• 10-digit phone number direct chat mein bhej kar search kar sakte ho.\n"
+        f"• Free users ko daily <b>{_free_limit()}</b> lookups milte hain.\n"
+        f"• Premium users ke paas unlimited lookups hain.\n"
+        f"• Sensitive fields (phone, aadhar, alt numbers) spoiler format mein aate hain; tap karke dekh sakte ho.\n\n{_D}"
     )
 
 def msg_queue(pos: int, query: str) -> str:
     bar = q_bar(pos)
     if pos == 1:
-        return f"<b>Teri baari hai bhai.</b>\n{bar}\n🔎 <code>{_e(query)}</code>\nFile khol raha hoon."
+        return f"⚡ <b>Teri baari hai bhai!</b>\n{bar}\n🔎 <code>{_e(query)}</code>\nData scan chalu hai..."
     return (
-        f"<b>Line lag gayi hai bhai, tu #{pos} pe hai.</b>\n{bar}\n"
-        f"🔎 <code>{_e(query)}</code>\nIntezar · ~{pos * 3}s"
+        f"⏳ <b>Line mein ho: #{pos}</b>\n{bar}\n"
+        f"🔎 <code>{_e(query)}</code>\nEstimated wait: ~{pos * 2}s"
     )
 
 def msg_searching(query: str) -> str:
-    return f"Bhai customer data dhoond raha hoon, thoda sabar kar...\n🔎 <code>{_e(query)}</code>"
+    return f"⚡ <b>Searching Multi-Source KC Repositories...</b>\n🔎 <code>{_e(query)}</code>"
 
 def msg_stage(query: str, label: str) -> str:
-    return f"{label}\n🔎 <code>{_e(query)}</code>"
+    return f"⚡ <b>{label}</b>\n🔎 <code>{_e(query)}</code>"
 
 def msg_no_result(query: str) -> str:
-    return f"<b>Kuch nahi mila bhai</b>\n🔎 <code>{_e(query)}</code>\n\nIs number pe koi record nahi pada.\n\n{_D}"
+    return f"<b>❌ Koi Record Nahi Mila</b>\n🔎 Target: <code>{_e(query)}</code>\n\nIs number ka koi entry dono directories mein match nahi hua.\n\n{_D}"
 
 def msg_limit(u: dict) -> str:
     return (
-        f"<b>Aaj ke free lookups khatam bhai.</b>\n\n"
-        f"Free members ko {_free_limit()} roz milte hain. Premium pe cap nahi.\n\n"
-        f"File pe lookups · <b>{int(u.get('searches') or 0)}</b>\n\n{_D}"
+        f"<b>⚠️ Aaj ke free lookups khatam ho gaye!</b>\n\n"
+        f"Free users ko roz {_free_limit()} searches milte hain. Premium pass le kar unlimited searches unlock kar sakte ho.\n\n"
+        f"Total lookups: <b>{int(u.get('searches') or 0)}</b>\n\n{_D}"
     )
 
 def msg_spin(u: dict, pending: str | None) -> str:
     left = _jackpots_left()
-    held = f"\n\nTera number <code>{_e(pending)}</code> ruk gaya hai. Spin ke baad chalega." if pending else ""
+    held = f"\n\n🎯 Target <code>{_e(pending)}</code> paused. Spin ke baad scan shuru hoga." if pending else ""
     return (
-        f"🎰 <b>Lucky spin</b>\n\n"
-        f"Agli window · <b>{_e(_countdown())}</b>\n"
-        f"Cadence · {SPIN_INTERVAL}\n"
-        f"Is window ke premium jackpot bache · <b>{left}</b> of {SPIN_WINNER_LIMIT}\n\n"
-        f"Ek window, ek kheench. Teen seven pe ek din Premium.{held}\n\n{_D}"
+        f"🎰 <b>KaramChand Daily Lucky Spin</b>\n\n"
+        f"Agla spin window: <b>{_e(_countdown())}</b>\n"
+        f"Jackpot winners remaining: <b>{left}</b> / {SPIN_WINNER_LIMIT}\n\n"
+        f"Har din ek spin! Reels ghuma aur jeeto free lookups ya premium pass.{held}\n\n{_D}"
     )
 
 def msg_welcome(name: str) -> str:
@@ -1125,9 +1187,9 @@ def msg_welcome(name: str) -> str:
         "id": 0, "name": name, "is_premium": False, "premium_until": 0,
         "daily_searches": 0, "last_search_date": "", "searches": 0,
     })
-    
-    # ═══════════════════════════════════════════════════════════════════════════════
-#  RESULT CARD & HTML
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RESULT CARD & HTML (Clean Sources: KC-SOURCE-01, KC-SOURCE-02)
 # ═══════════════════════════════════════════════════════════════════════════════
 def _spoiler(value: str) -> str:
     return f"<tg-spoiler><code>{_e(value)}</code></tg-spoiler>"
@@ -1144,20 +1206,26 @@ def format_card(row: dict, query: str, elapsed: float | None = None) -> str:
     district     = sv(row.get("district"))
     town         = sv(row.get("town"))
 
-    lines = ["<b>Customer file</b>", "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄", f"🔎 <code>{_e(query)}</code>", ""]
-    if name:         lines.append(f"👤 <b>Naam</b> ➡️ {_e(name)}")
-    if fathersName:  lines.append(f"👨 <b>Father</b> ➡️ {_e(fathersName)}")
-    if phoneNumber:  lines.append(f"📱 <b>Number</b> ➡️ {_spoiler(phoneNumber)}")
-    if otherNumber:  lines.append(f"📞 <b>Dusra number</b> ➡️ {_spoiler(otherNumber)}")
-    if aadharNumber: lines.append(f"🪪 <b>ID</b> ➡️ {_spoiler(aadharNumber)}")
-    if address:      lines.append(f"🏠 <b>Address</b>\n<blockquote expandable>{_e(address)}</blockquote>")
+    lines = [
+        "<b>⚡ KC CUSTOMER FILE</b>",
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+        f"🔎 <b>Target:</b> <code>{_e(query)}</code>",
+        "",
+        "📁 <b>KC-SOURCE-01</b>",
+    ]
+    if name:         lines.append(f"  👤 <b>Naam:</b> {_e(name)}")
+    if fathersName:  lines.append(f"  👨 <b>Father:</b> {_e(fathersName)}")
+    if phoneNumber:  lines.append(f"  📱 <b>Number:</b> {_spoiler(phoneNumber)}")
+    if otherNumber:  lines.append(f"  📞 <b>Dusra:</b> {_spoiler(otherNumber)}")
+    if aadharNumber: lines.append(f"  🪪 <b>ID:</b> {_spoiler(aadharNumber)}")
+    if address:      lines.append(f"  🏠 <b>Address:</b>\n<blockquote expandable>{_e(address)}</blockquote>")
     loc = ", ".join(x for x in [town, district, state] if x)
-    if loc:          lines.append(f"📍 <b>Location</b> ➡️ {_e(loc)}")
-    if pincode:      lines.append(f"📮 <b>Zip</b> ➡️ <code>{_e(pincode)}</code>")
+    if loc:          lines.append(f"  📍 <b>Location:</b> {_e(loc)}")
+    if pincode:      lines.append(f"  📮 <b>Zip:</b> <code>{_e(pincode)}</code>")
     lines += ["", f"🕰 {ts_str()}"]
     if elapsed is not None:
         lines.append(f"⚡ Speed: {elapsed_label(elapsed)}")
-        if elapsed < 1.0: lines.append("🏎️ BHAI YE TOH ROCKET THA")
+        if elapsed < 1.0: lines.append("🏎️ <b>BHAI YE TOH ROCKET THA</b>")
     lines.append(_D)
     return "\n".join(lines)
 
@@ -1165,9 +1233,14 @@ def format_card_combined(
     row_main: dict | None, row_umba: dict | None,
     query: str, elapsed: float | None = None
 ) -> str:
-    lines = ["<b>Customer file · Combined</b>", "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄", f"🔎 <code>{_e(query)}</code>", ""]
+    lines = [
+        "<b>⚡ KC CUSTOMER FILE</b>",
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+        f"🔎 <b>Target:</b> <code>{_e(query)}</code>",
+        "",
+        "📁 <b>KC-SOURCE-01</b>",
+    ]
 
-    lines.append("📁 <b>icrm-hitek</b>")
     if row_main:
         name         = sv(row_main.get("name"))
         fathersName  = sv(row_main.get("fathersName"))
@@ -1179,23 +1252,23 @@ def format_card_combined(
         pincode      = sv(row_main.get("pincode"))
         district     = sv(row_main.get("district"))
         town         = sv(row_main.get("town"))
-        if name:         lines.append(f"  👤 <b>Naam</b>     ➡️ {_e(name)}")
-        if fathersName:  lines.append(f"  👨 <b>Father</b>   ➡️ {_e(fathersName)}")
-        if phoneNumber:  lines.append(f"  📱 <b>Number</b>   ➡️ {_spoiler(phoneNumber)}")
-        if otherNumber:  lines.append(f"  📞 <b>Dusra</b>    ➡️ {_spoiler(otherNumber)}")
-        if aadharNumber: lines.append(f"  🪪 <b>ID</b>        ➡️ {_spoiler(aadharNumber)}")
-        if address:      lines.append(f"  🏠 <b>Address</b>\n<blockquote expandable>{_e(address)}</blockquote>")
+        if name:         lines.append(f"  👤 <b>Naam:</b> {_e(name)}")
+        if fathersName:  lines.append(f"  👨 <b>Father:</b> {_e(fathersName)}")
+        if phoneNumber:  lines.append(f"  📱 <b>Number:</b> {_spoiler(phoneNumber)}")
+        if otherNumber:  lines.append(f"  📞 <b>Dusra:</b> {_spoiler(otherNumber)}")
+        if aadharNumber: lines.append(f"  🪪 <b>ID:</b> {_spoiler(aadharNumber)}")
+        if address:      lines.append(f"  🏠 <b>Address:</b>\n<blockquote expandable>{_e(address)}</blockquote>")
         loc = ", ".join(x for x in [town, district, state] if x)
-        if loc:          lines.append(f"  📍 <b>Location</b> ➡️ {_e(loc)}")
-        if pincode:      lines.append(f"  📮 <b>Zip</b>       ➡️ <code>{_e(pincode)}</code>")
+        if loc:          lines.append(f"  📍 <b>Location:</b> {_e(loc)}")
+        if pincode:      lines.append(f"  📮 <b>Zip:</b> <code>{_e(pincode)}</code>")
     else:
-        lines.append("  <i>Kuch nahi mila</i>")
+        lines.append("  <i>Koi record nahi mila</i>")
 
     lines.append("")
     lines.append("┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
     lines.append("")
 
-    lines.append("📂 <b>Umba</b>")
+    lines.append("📂 <b>KC-SOURCE-02</b>")
     if row_umba:
         u_phone   = sv(row_umba.get("phoneNumber"))
         u_name    = sv(row_umba.get("name"))
@@ -1203,20 +1276,20 @@ def format_card_combined(
         u_email   = sv(row_umba.get("email"))
         u_gender  = sv(row_umba.get("gender"))
         u_carrier = sv(row_umba.get("carrier"))
-        if u_name:    lines.append(f"  👤 <b>Naam</b>    ➡️ {_e(u_name)}")
-        if u_phone:   lines.append(f"  📱 <b>Number</b>  ➡️ {_spoiler(u_phone)}")
-        if u_address: lines.append(f"  🏠 <b>Address</b>\n<blockquote expandable>{_e(u_address)}</blockquote>")
-        if u_email:   lines.append(f"  📧 <b>Email</b>   ➡️ {_spoiler(u_email)}")
-        if u_gender:  lines.append(f"  🧬 <b>Gender</b>  ➡️ {_e(u_gender)}")
-        if u_carrier: lines.append(f"  📡 <b>Carrier</b> ➡️ {_e(u_carrier)}")
+        if u_name:    lines.append(f"  👤 <b>Naam:</b> {_e(u_name)}")
+        if u_phone:   lines.append(f"  📱 <b>Number:</b> {_spoiler(u_phone)}")
+        if u_address: lines.append(f"  🏠 <b>Address:</b>\n<blockquote expandable>{_e(u_address)}</blockquote>")
+        if u_email:   lines.append(f"  📧 <b>Email:</b> {_spoiler(u_email)}")
+        if u_gender:  lines.append(f"  🧬 <b>Gender:</b> {_e(u_gender)}")
+        if u_carrier: lines.append(f"  📡 <b>Carrier:</b> {_e(u_carrier)}")
     else:
-        lines.append("  <i>Kuch nahi mila</i>")
+        lines.append("  <i>Koi record nahi mila</i>")
 
     lines += ["", f"🕰 {ts_str()}"]
     if elapsed is not None:
         lines.append(f"⚡ Speed: {elapsed_label(elapsed)}")
         if elapsed < 1.0:
-            lines.append("🏎️ BHAI YE TOH ROCKET THA")
+            lines.append("🏎️ <b>BHAI YE TOH ROCKET THA</b>")
     lines.append(_D)
     return "\n".join(lines)
 
@@ -1224,9 +1297,9 @@ _HTML_CSS = """
 :root { --ink:#16130f; --paper:#f7f1e6; --gold:#8a6d3b; --line:#e0d3bf; --mute:#6e6458; }
 * { box-sizing: border-box; }
 body { margin:0; background:#e7dcc6; color:var(--ink); font: 16px/1.55 Georgia, serif; }
-article { max-width: 680px; margin: 36px auto; background: var(--paper); padding: 48px 44px 40px; }
+article { max-width: 680px; margin: 36px auto; background: var(--paper); padding: 48px 44px 40px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); border-radius: 6px; }
 .kicker { margin:0; font: 600 11px/1.4 sans-serif; letter-spacing: .22em; text-transform: uppercase; color: var(--gold); }
-h1 { font-weight: 500; font-size: 36px; line-height: 1.15; margin: 10px 0 0; }
+h1 { font-weight: 500; font-size: 32px; line-height: 1.15; margin: 10px 0 0; }
 .rule { height: 1px; border: 0; margin: 22px 0; background: linear-gradient(90deg, #c6a15b, transparent); }
 .rows { display: grid; grid-template-columns: 168px 1fr; gap: 12px 18px; word-wrap: break-word; max-width: 100%; overflow-wrap: break-word; }
 .k { font: 600 11px/1.4 sans-serif; letter-spacing: .08em; text-transform: uppercase; color: var(--mute); padding-top: 4px; }
@@ -1243,13 +1316,14 @@ def _html_page(title: str, kicker: str, pairs: list[tuple[str, str]], memo: str)
 <body><article><p class="kicker">{_e(kicker)}</p><h1>{_e(title)}</h1><hr class="rule"/>
 <section class="rows">{''.join(cells)}</section>
 <section class="memo"><b>Memo</b><p>{memo}</p></section>
-<footer>{_e(BOT_NAME)} · Private desk · {_e(ts_str())}</footer></article></body></html>"""
+<footer>{_e(BOT_NAME)} · Private intelligence report · {_e(ts_str())}</footer></article></body></html>"""
 
 def generate_html(row: dict, query: str) -> str:
     address = clean_addr(row.get("address"))
     loc = ", ".join(x for x in [sv(row.get("town")), sv(row.get("district")), sv(row.get("state"))] if x)
     pairs = [
         ("Query", f"<code>{_e(query)}</code>"),
+        ("Source", "<b>KC-SOURCE-01</b>"),
         ("Naam", _e(sv(row.get("name")))),
         ("Father", _e(sv(row.get("fathersName")))),
         ("Number", _e(sv(row.get("phoneNumber")))),
@@ -1259,14 +1333,14 @@ def generate_html(row: dict, query: str) -> str:
         ("Location", _e(loc)),
         ("Zip", _e(sv(row.get("pincode")))),
     ]
-    memo = f"{_e(BOT_NAME)} ne ye note directory se nikala. Private file hai. Rakh le, ya phaad de — teri marzi."
-    title = sv(row.get("name")) or f"Note for {query}"
-    return _html_page(title, f"{BOT_NAME} · Customer file", pairs, memo)
+    memo = f"{_e(BOT_NAME)} private directory file."
+    title = sv(row.get("name")) or f"Report for {query}"
+    return _html_page(title, f"{BOT_NAME} · Intelligence File", pairs, memo)
 
 def generate_html_combined(row_main: dict | None, row_umba: dict | None, query: str) -> str:
-    pairs: list[tuple[str, str]] = [("Query", f"<code>{_e(query)}</code>")]
+    pairs: list[tuple[str, str]] = [("Target", f"<code>{_e(query)}</code>")]
 
-    pairs.append(("📁 Source", "<b>icrm-hitek</b>"))
+    pairs.append(("📁 Source", "<b>KC-SOURCE-01</b>"))
     if row_main:
         address = clean_addr(row_main.get("address"))
         loc = ", ".join(x for x in [sv(row_main.get("town")), sv(row_main.get("district")), sv(row_main.get("state"))] if x)
@@ -1283,9 +1357,9 @@ def generate_html_combined(row_main: dict | None, row_umba: dict | None, query: 
             if val:
                 pairs.append((label, val))
     else:
-        pairs.append(("Status", "<i>No record found</i>"))
+        pairs.append(("KC-SOURCE-01 Status", "<i>No record found</i>"))
 
-    pairs.append(("📂 Source", "<b>Umba</b>"))
+    pairs.append(("📂 Source", "<b>KC-SOURCE-02</b>"))
     if row_umba:
         u_addr = clean_addr(row_umba.get("address"))
         for label, val in [
@@ -1299,11 +1373,11 @@ def generate_html_combined(row_main: dict | None, row_umba: dict | None, query: 
             if val:
                 pairs.append((label, val))
     else:
-        pairs.append(("Status", "<i>No record found</i>"))
+        pairs.append(("KC-SOURCE-02 Status", "<i>No record found</i>"))
 
-    memo = f"{_e(BOT_NAME)} ne ye dono directories se nikala. Private file hai. Rakh le, ya phaad de."
-    name = sv((row_main or {}).get("name")) or sv((row_umba or {}).get("name")) or f"Note for {query}"
-    return _html_page(name, f"{BOT_NAME} · Combined file", pairs, memo)
+    memo = f"{_e(BOT_NAME)} verified intelligence multi-source report."
+    name = sv((row_main or {}).get("name")) or sv((row_umba or {}).get("name")) or f"Report for {query}"
+    return _html_page(name, f"{BOT_NAME} · Multi-Source Intelligence", pairs, memo)
 
 def generate_receipt_html(user: dict, plan: dict, when: str, expiry: str, utr: str = "", gateway: str = "", invoice_id: str = "") -> str:
     pairs = [
@@ -1318,7 +1392,7 @@ def generate_receipt_html(user: dict, plan: dict, when: str, expiry: str, utr: s
         ("Lookups ab tak", _e(str(int(user.get("searches") or 0)))),
         ("Reference", _e(utr)),
     ]
-    memo = f"{_e(BOT_NAME)} confirm karta hai — ye membership settle ho gayi. Invoice <b>{_e(invoice_id or '—')}</b> desk pe save hai."
+    memo = f"{_e(BOT_NAME)} confirm karta hai — membership settle ho gayi. Invoice <b>{_e(invoice_id or '—')}</b> save hai."
     return _html_page(f"{plan['name']} · {user.get('name') or 'Bhai'}", f"{BOT_NAME} · Membership memo", pairs, memo)
 
 def send_html_doc(cid: int, row: dict, query: str) -> None:
@@ -1429,7 +1503,7 @@ def _start_plan(cid: int, mid: int | None, plan: dict) -> None:
         return
     desk_edit(
         cid, mid,
-        f"<b>{_e(plan['name'])}</b> · ₹{plan['amount']}\n\nKaunsa rasta chalana hai bhai? UPI, Stars, ya Crypto.",
+        f"<b>{_e(plan['name'])}</b> · ₹{plan['amount']}\n\nKaunsa payment method use karna hai?",
         kb=_gateway_kb(plan["id"]),
     )
 
@@ -1447,8 +1521,8 @@ def _open_checkout(cid: int, mid: int | None, plan: dict) -> None:
         f"Exact amount kisi bhi UPI app se bhej. Phir button daba ke 12 digit UTR daal."
     )
     kb = [
-        [{"text": "✅ Payment ho gaya", "callback_data": f"paid:{plan['id']}"}],
-        [{"text": "Payment chhod", "callback_data": "paycancel"}, {"text": "Wapas", "callback_data": "premium"}],
+        [{"text": "✅ Payment ho gaya (UTR daal)", "callback_data": f"paid:{plan['id']}"}],
+        [{"text": "❌ Cancel", "callback_data": "paycancel"}, {"text": "🔙 Wapas", "callback_data": "premium"}],
     ]
     res = tg("sendPhoto", {
         "chat_id": cid, "photo": qr, "caption": caption,
@@ -1472,7 +1546,7 @@ def _open_stars(cid: int, mid: int | None, plan: dict) -> None:
         "currency": "XTR",
         "prices": [{"label": str(plan["name"])[:32], "amount": stars}],
     })
-    kb = [[{"text": "Payment chhod", "callback_data": "paycancel"}], [{"text": "Wapas", "callback_data": "premium"}]]
+    kb = [[{"text": "❌ Cancel", "callback_data": "paycancel"}], [{"text": "🔙 Wapas", "callback_data": "premium"}]]
     if res.get("ok"):
         desk_edit(cid, mid, f"Stars invoice upar hai bhai. <b>{stars}</b> stars · {_e(plan['name'])}. Pay kar, desk khud khul jayegi.", kb=kb)
         return
@@ -1487,7 +1561,7 @@ def _open_crypto(cid: int, mid: int | None, plan: dict) -> None:
         f"TRC20 · <code>{_e(USDT_TRC20)}</code>\n\n"
         f"Tx hash yahin bhej. Admin check karega tab premium khulega. Random bakwaas mat daal."
     )
-    kb = [[{"text": "Payment chhod", "callback_data": "paycancel"}], [{"text": "Wapas", "callback_data": "premium"}]]
+    kb = [[{"text": "❌ Cancel", "callback_data": "paycancel"}], [{"text": "🔙 Wapas", "callback_data": "premium"}]]
     desk_edit(cid, mid, text, kb=kb)
 
 def _new_invoice_id() -> str:
@@ -1609,7 +1683,6 @@ def _settle_payment(payment_id: str, approve: bool, admin_mid: int | None, actor
         if admin_mid:
             edit_msg(actor or ADMIN_ID, admin_mid, f"Ye reference pehle hi {row['status']} ho chuka.")
         return
-    # Atomic claim to prevent double-approve race.
     if not _claim_payment(payment_id):
         if admin_mid:
             edit_msg(actor or ADMIN_ID, admin_mid, "Ye reference abhi doosre operator ne pakda hai.")
@@ -1782,7 +1855,7 @@ def _broadcast(audience: str, text: str) -> None:
             sent += 1
         else:
             failed += 1
-        time.sleep(0.05)
+        time.sleep(0.04)
         if i % 100 == 0:
             send_msg(ADMIN_ID, f"Broadcast progress · {i}/{len(rows)} sent · {sent} ok · {failed} fail")
     who = "Premium walon" if audience == "prem" else "sab members"
@@ -2030,7 +2103,7 @@ def admin_send_csv(cid: int) -> None:
         ])
     data = buf.getvalue().encode("utf-8")
     try:
-        requests.post(
+        _session.post(
             f"{BASE_URL}/sendDocument",
             data={"chat_id": str(cid), "caption": "📋 Users CSV, le bhai."},
             files={"document": ("users.csv", io.BytesIO(data), "text/csv")},
@@ -2077,8 +2150,6 @@ def _restore_db(blob: bytes) -> str | None:
     except Exception as exc:
         MAINTENANCE = True
         return "DB file lagi nahi bhai: " + str(exc)
-    # SQLite restored successfully — maintenance is cleared. DuckDB is checked
-    # separately, so a temporarily-down HF bucket does not block DB restore.
     MAINTENANCE = False
     try:
         db_search("7417679558")
@@ -2238,12 +2309,12 @@ def _render_backups(cid: int) -> tuple[str, list]:
         mtime = fmt_ts(os.path.getmtime(path))
         lines.append(f"• <code>{_e(os.path.basename(path))}</code> · {mtime}")
         kb.append([{"text": f"Bhej {i + 1}", "callback_data": f"d:bk:{i}"}])
-    kb.append([{"text": "Wapas", "callback_data": "d:home"}])
+    kb.append([{"text": "🔙 Wapas", "callback_data": "d:home"}])
     return _clip("\n".join(lines) + f"\n\n{_D}"), kb
 
 def _render_tickets(cid: int, page: int) -> tuple[str, list]:
     if _sql is None:
-        return "Bhai DB missing hai. Ticket kahan se aayega?", [[{"text": "Wapas", "callback_data": "d:home"}]]
+        return "Bhai DB missing hai. Ticket kahan se aayega?", [[{"text": "🔙 Wapas", "callback_data": "d:home"}]]
     page = max(0, page)
     size = 4
     with _sql_lock:
@@ -2268,13 +2339,13 @@ def _render_tickets(cid: int, page: int) -> tuple[str, list]:
         nav.append({"text": "▶️", "callback_data": f"d:tik:{page + 1}"})
     if nav:
         kb.append(nav)
-    kb.append([{"text": "Wapas", "callback_data": "d:home"}])
+    kb.append([{"text": "🔙 Wapas", "callback_data": "d:home"}])
     return _clip("\n".join(lines) + f"\n\n{_D}"), kb
 
 def _render_ticket(cid: int, tid: int) -> tuple[str, list]:
     row = _ticket(tid)
     if row is None:
-        return "Bhai ye ticket gayab hai.", [[{"text": "Wapas", "callback_data": "d:tik"}]]
+        return "Bhai ye ticket gayab hai.", [[{"text": "🔙 Wapas", "callback_data": "d:tik"}]]
     owner = int(row["agent_id"] or 0)
     user = _load_user(int(row["chat_id"]))
     uname = (user or {}).get("name") or "Bhai"
@@ -2308,12 +2379,12 @@ def _render_ticket(cid: int, tid: int) -> tuple[str, list]:
         ])
     elif row["status"] == "claimed" and owner != cid:
         lines += ["", "Bhai ye ticket kisi aur pe lock hai. Interfere mat kar. Super admin /removerole se unfreeze kare."]
-    kb.append([{"text": "Wapas tickets", "callback_data": "d:tik"}])
+    kb.append([{"text": "🔙 Wapas tickets", "callback_data": "d:tik"}])
     return _clip("\n".join(lines) + f"\n\n{_D}"), kb
 
 def _render_users(cid: int, page: int) -> tuple[str, list]:
     if _sql is None:
-        return "Bhai DB missing hai.", [[{"text": "Wapas", "callback_data": "d:home"}]]
+        return "Bhai DB missing hai.", [[{"text": "🔙 Wapas", "callback_data": "d:home"}]]
     page = max(0, page)
     size = 6
     with _sql_lock:
@@ -2341,13 +2412,13 @@ def _render_users(cid: int, page: int) -> tuple[str, list]:
         nav.append({"text": "▶️", "callback_data": f"d:usr:{page + 1}"})
     if nav:
         kb.append(nav)
-    kb.append([{"text": "Wapas", "callback_data": "d:home"}])
+    kb.append([{"text": "🔙 Wapas", "callback_data": "d:home"}])
     return _clip("\n".join(lines) + f"\n\n{_D}"), kb
 
 def _render_user(cid: int, target: int) -> tuple[str, list]:
     user = _load_user(target)
     if user is None:
-        return "Bhai ye user file pe nahi.", [[{"text": "Wapas", "callback_data": "d:usr"}]]
+        return "Bhai ye user file pe nahi.", [[{"text": "🔙 Wapas", "callback_data": "d:usr"}]]
     text = msg_profile(user) + "\n<b>Ban history</b>\n" + "\n".join(_ban_history_lines(target, 8))
     kb = []
     if cid == ADMIN_ID and target != ADMIN_ID:
@@ -2355,7 +2426,7 @@ def _render_user(cid: int, target: int) -> tuple[str, list]:
             kb.append([{"text": "Unban", "callback_data": f"d:ub:{target}"}])
         else:
             kb.append([{"text": "Ban", "callback_data": f"d:bn:{target}"}])
-    kb.append([{"text": "Wapas users", "callback_data": "d:usr"}])
+    kb.append([{"text": "🔙 Wapas users", "callback_data": "d:usr"}])
     return _clip(text), kb
 
 def _render_settings(cid: int) -> tuple[str, list]:
@@ -2380,12 +2451,12 @@ def _render_settings(cid: int) -> tuple[str, list]:
         for gw, title in (("upi", "UPI"), ("stars", "Stars"), ("crypto", "Crypto")):
             label = f"{title} {'band kar' if _gw_on(gw) else 'chalu kar'}"
             kb.append([{"text": label, "callback_data": f"gwtog:{gw}"}])
-    kb.append([{"text": "Wapas", "callback_data": "d:home"}])
+    kb.append([{"text": "🔙 Wapas", "callback_data": "d:home"}])
     return _clip("\n".join(lines)), kb
 
 def _render_invoices(cid: int, page: int) -> tuple[str, list]:
     if _sql is None:
-        return "Bhai DB missing hai.", [[{"text": "Wapas", "callback_data": "d:home"}]]
+        return "Bhai DB missing hai.", [[{"text": "🔙 Wapas", "callback_data": "d:home"}]]
     page = max(0, page)
     size = 5
     with _sql_lock:
@@ -2423,7 +2494,7 @@ def _render_invoices(cid: int, page: int) -> tuple[str, list]:
         nav.append({"text": "▶️", "callback_data": f"d:inv:{page + 1}"})
     if nav:
         kb.append(nav)
-    kb.append([{"text": "Wapas", "callback_data": "d:home"}])
+    kb.append([{"text": "🔙 Wapas", "callback_data": "d:home"}])
     return _clip("\n".join(lines) + f"\n\n{_D}"), kb
 
 def _render_desk(cid: int, section: str, page: int = 0, focus: int | None = None) -> tuple[str, list]:
@@ -2500,7 +2571,7 @@ def _send_backup(cid: int, idx: int) -> None:
     try:
         with open(path, "rb") as fh:
             blob = fh.read()
-        requests.post(
+        _session.post(
             f"{BASE_URL}/sendDocument",
             data={"chat_id": str(cid), "caption": "📁 Backup · " + os.path.basename(path)},
             files={"document": (os.path.basename(path), io.BytesIO(blob), "application/x-sqlite3")},
@@ -2558,7 +2629,7 @@ def _cmd_mywork(cid: int) -> None:
     data = buf.getvalue().encode("utf-8")
     caption = f"📋 Tera kaam · tickets {len(rows)} · resolved {resolved} · replies {reply_n}"
     try:
-        requests.post(
+        _session.post(
             f"{BASE_URL}/sendDocument",
             data={"chat_id": str(cid), "caption": caption},
             files={"document": ("mywork.csv", io.BytesIO(data), "text/csv")},
@@ -2640,7 +2711,7 @@ def _cmd_role_audit(cid: int, raw: str) -> None:
         send_msg(cid, text)
         return
     try:
-        requests.post(
+        _session.post(
             f"{BASE_URL}/sendDocument",
             data={"chat_id": str(cid), "caption": f"📜 Role audit · {target}"},
             files={"document": (f"role_{target}.txt", io.BytesIO(text.encode('utf-8')), "text/plain")},
@@ -2672,9 +2743,9 @@ def _ask_pay_search(cid: int, number: str) -> None:
             {"text": "Nahi, payment chalu", "callback_data": "paysearch:no"},
         ]],
     )
-    
-    # ═══════════════════════════════════════════════════════════════════════════════
-#  WORKER THREAD
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  WORKER THREAD (High-Speed Concurrent Multi-Source Querying)
 # ═══════════════════════════════════════════════════════════════════════════════
 _HACKER_STAGES = (
     "Firewall tod raha hoon...",
@@ -2758,14 +2829,45 @@ def worker() -> None:
                     pass
 
             edit_msg(cid, mid, msg_searching(query))
-            for label in _next_load_stages():
+
+            # Run searches concurrently in parallel threads to eliminate latency
+            stages = _next_load_stages()
+            res_main: list[dict] = []
+            res_umba: list[dict] = []
+
+            def _fetch_main():
+                nonlocal res_main
+                try:
+                    res_main = db_search(query)
+                except Exception as ex:
+                    log.warning("KC-SOURCE-01 query error: %s", ex)
+                    res_main = []
+
+            def _fetch_umba():
+                nonlocal res_umba
+                try:
+                    res_umba = db_search_umba(query)
+                except Exception as ex:
+                    log.warning("KC-SOURCE-02 query error: %s", ex)
+                    res_umba = []
+
+            t_db = time.monotonic()
+            th_main = threading.Thread(target=_fetch_main, daemon=True)
+            th_umba = threading.Thread(target=_fetch_umba, daemon=True)
+            th_main.start()
+            th_umba.start()
+
+            # Display quick animated hacker stages
+            for label in stages[:2]:
                 time.sleep(_STAGE_GAP)
                 edit_msg(cid, mid, msg_stage(query, label))
 
-            t_db = time.monotonic()
-            rows_main = db_search(query)
-            rows_umba = db_search_umba(query)
+            th_main.join(timeout=15.0)
+            th_umba.join(timeout=15.0)
             elapsed = time.monotonic() - t_db
+
+            rows_main = res_main
+            rows_umba = res_umba
 
             with _sl:
                 global_stats["searches"] += 1
@@ -2795,7 +2897,7 @@ def worker() -> None:
                 row_main = rows_main[0] if rows_main else None
                 row_umba = rows_umba[0] if rows_umba else None
                 edit_msg(cid, mid, msg_stage(query, "✅ Match mil gaya!"))
-                time.sleep(0.35)
+                time.sleep(0.2)
                 edit_msg(
                     cid, mid,
                     format_card_combined(row_main, row_umba, query, elapsed),
@@ -2804,7 +2906,7 @@ def worker() -> None:
 
         except Exception:
             log.exception("Worker error")
-            edit_msg(cid, mid, "⚠️ Bhai desk phat gaya is lookup pe. Thodi der ruk, phir try kar.")
+            edit_msg(cid, mid, "⚠️ Bhai lookup mein dikkat aayi. Thodi der ruk, phir try kar.", kb=back_kb())
         finally:
             with _sl:
                 active_users.discard(cid)
@@ -2839,7 +2941,7 @@ def _session_gc() -> None:
 def admin_send_logs(cid: int) -> None:
     data = "\n".join(_ring.tail(150)).encode()
     try:
-        requests.post(
+        _session.post(
             f"{BASE_URL}/sendDocument",
             data={"chat_id": cid, "caption": "📋 <b>Logs</b> · 12h IST", "parse_mode": "HTML"},
             files={"document": ("bot_logs.txt", io.BytesIO(data), "text/plain")},
@@ -2890,7 +2992,7 @@ def _enqueue_search(cid: int, query: str) -> None:
                 user["last_search_date"] = today
                 _save_user(user)
         if blocked:
-            send_msg(cid, msg_limit(user), kb=[[{"text": "👑 Premium", "callback_data": "premium"}]])
+            send_msg(cid, msg_limit(user), kb=[[{"text": "👑 Premium Pass", "callback_data": "premium"}]])
             return
     if _search_q.qsize() >= MAX_QUEUE:
         if counted:
@@ -3071,7 +3173,7 @@ def handle_pre_checkout(q: dict) -> None:
     if not qid:
         return
     try:
-        requests.post(
+        _session.post(
             f"{BASE_URL}/answerPreCheckoutQuery",
             json={"pre_checkout_query_id": qid, "ok": True},
             timeout=5,
@@ -3105,7 +3207,7 @@ def handle_cb(cb: dict) -> None:
             if err:
                 send_msg(cid, f"❌ {_e(err)}")
             else:
-                send_msg(cid, "✅ Fresh users.db ban gaya! Maintenance OFF. Ab tu normal chalega.")
+                send_msg(cid, "✅ Fresh users.db ban gaya! Maintenance OFF. Ab normal chalega.")
         else:
             send_msg(cid, "Theek hai, cancel.")
         return
@@ -3147,7 +3249,7 @@ def handle_cb(cb: dict) -> None:
             send_msg(cid, "Theek hai, nayi price broadcast kar raha hoon.")
             threading.Thread(target=_broadcast, args=("all", blurb), daemon=True).start()
         else:
-            send_msg(cid, "Broadcast nahi kiya. Price file pe update hai, log ko alag se bol dena.")
+            send_msg(cid, "Broadcast nahi kiya. Price file pe update hai.")
         return
 
     if data == "paycancel":
@@ -3171,7 +3273,7 @@ def handle_cb(cb: dict) -> None:
 
     if data == "verify":
         if _needs_join(cid):
-            desk_edit(cid, mid, msg_force() + "\n\nAbhi bhi channel baaki hai. Join kar, phir check daba.", kb=force_kb())
+            desk_edit(cid, mid, msg_force() + "\n\nAbhi bhi channel baaki hai. Join kar, phir verify daba.", kb=force_kb())
             return
         _show_dashboard(cid, mid)
         return
@@ -3257,7 +3359,7 @@ def handle_cb(cb: dict) -> None:
         audience = "prem" if data.endswith("prem") else "all"
         flow[cid] = {"mode": "WAITING_FOR_BROADCAST", "audience": audience}
         who = "sirf Premium wale" if audience == "prem" else "har member"
-        desk_edit(cid, mid, f"Agle message bhej. Ye <b>{who}</b> ke paas jayega.\n\n/cancel se ye band.")
+        desk_edit(cid, mid, f"Agla message bhej. Ye <b>{who}</b> ke paas jayega.\n\n/cancel se ye band.")
     elif data.startswith("pg:"):
         page = int(data.split(":")[1])
         with _sl:
@@ -3295,7 +3397,7 @@ def handle_cb(cb: dict) -> None:
                     cid,
                     f"{BOT_NAME}_Report_{phone}.html",
                     generate_html_combined(row_main, row_umba, query),
-                    "📄 Le bhai, combined directory note attach hai.",
+                    "📄 Le bhai, teri KC directory note attach hai.",
                 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3322,7 +3424,7 @@ def _dispatch_cmd(cid: int, raw: str) -> None:
         return
     if cmd == "/cancel":
         _clear_flow(cid)
-        send_msg(cid, "Cancel kar diya bhai.")
+        send_msg(cid, "Cancel kar diya bhai.", kb=dashboard_kb())
         return
     if cmd == "/help":
         send_msg(cid, msg_help(), kb=dashboard_kb())
@@ -3337,7 +3439,7 @@ def _dispatch_cmd(cid: int, raw: str) -> None:
             return
         if cmd == "/broadcast":
             _clear_flow(cid)
-            send_msg(cid, "<b>Broadcast</b>\n\nAgle message kisko bheju?", kb=broadcast_kb())
+            send_msg(cid, "<b>Broadcast</b>\n\nAgla message kisko bheju?", kb=broadcast_kb())
             return
         if cmd == "/grant":
             _admin_grant(cid, raw)
@@ -3381,7 +3483,7 @@ def _dispatch_cmd(cid: int, raw: str) -> None:
             
         if cmd == "/dashboard":
             if cid in _desk:
-                _desk[cid]["mid"] = None  # Force a fresh message
+                _desk[cid]["mid"] = None
             _open_desk(cid, "home")
             return
         
@@ -3397,7 +3499,7 @@ def _dispatch_cmd(cid: int, raw: str) -> None:
             
     if cmd == "/dashboard" and _can_desk(cid):
         if cid in _desk:
-            _desk[cid]["mid"] = None  # Force a fresh message
+            _desk[cid]["mid"] = None
         _open_desk(cid, "home")
         return
     
@@ -3442,11 +3544,10 @@ def handle_msg(msg: dict) -> None:
     state = flow.get(cid) or {}
     mode = state.get("mode")
 
-    # ---- FIXED BROADCAST TRAP HERE ----
     if cid == ADMIN_ID and mode == "WAITING_FOR_BROADCAST":
         if raw == "/cancel":
             _clear_flow(cid)
-            send_msg(cid, "Broadcast cancel.")
+            send_msg(cid, "Broadcast cancel.", kb=dashboard_kb())
             return
         if not raw.startswith("/"):
             audience = state.get("audience") or "all"
@@ -3454,8 +3555,6 @@ def handle_msg(msg: dict) -> None:
             send_msg(cid, "Bhej raha hoon.")
             threading.Thread(target=_broadcast, args=(audience, raw), daemon=True).start()
             return
-        # If it starts with "/", it falls through to _dispatch_cmd below
-    # -----------------------------------
 
     if raw.startswith("/"):
         if cid != ADMIN_ID and _banned(user):
@@ -3518,7 +3617,7 @@ def handle_msg(msg: dict) -> None:
         return
 
     if mode == "stars":
-        send_msg(cid, "Bhai Stars wala invoice upar pada hai. Pay kar, ya Payment chhod daba.")
+        send_msg(cid, "Bhai Stars wala invoice upar pada hai. Pay kar, ya Cancel daba.")
         return
 
     if mode in {"checkout", "pay_choose", "crypto"}:
@@ -3580,7 +3679,7 @@ def handle_msg(msg: dict) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 def poll_telegram() -> None:
     try:
-        requests.get(f"{BASE_URL}/deleteWebhook?drop_pending_updates=true", timeout=5)
+        _session.get(f"{BASE_URL}/deleteWebhook?drop_pending_updates=true", timeout=5)
     except Exception:
         pass
     offset, backoff = None, 1
@@ -3588,7 +3687,7 @@ def poll_telegram() -> None:
         try:
             allowed = urllib.parse.quote(json.dumps(["message", "callback_query", "pre_checkout_query"]))
             url = f"{BASE_URL}/getUpdates?timeout=30&allowed_updates={allowed}" + (f"&offset={offset}" if offset else "")
-            resp = requests.get(url, timeout=35).json()
+            resp = _session.get(url, timeout=35).json()
             if not resp.get("ok"):
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
