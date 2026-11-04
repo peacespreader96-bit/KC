@@ -22,6 +22,7 @@ import random
 import re
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 import html as html_lib
@@ -64,16 +65,17 @@ BASE_URL         = f"https://api.telegram.org/bot{TOKEN}"
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configure your server architecture settings manually here (or via environment variables):
 SYS_RAM_LIMIT          = os.getenv("SYS_RAM_LIMIT",          "350MB")  # DuckDB memory limit (e.g. '300MB', '500MB', '1GB', '2GB')
-SYS_CPU_THREADS        = int(os.getenv("SYS_CPU_THREADS",    "1"))      # CPU worker threads for DuckDB (e.g. 1, 2, 4)
-SYS_CONCURRENT_SOURCES = int(os.getenv("SYS_CONCURRENT_SOURCES", "1"))  # Max sources queried at a time (1 to 7). Set 2 or 3 for 512MB Render!
+SYS_CPU_THREADS        = int(os.getenv("SYS_CPU_THREADS",    "2"))      # CPU worker threads for DuckDB (e.g. 1, 2, 4)
+SYS_CONCURRENT_SOURCES = int(os.getenv("SYS_CONCURRENT_SOURCES", "3"))  # Max sources queried at a time (1 to 7). Set 2 or 3 for 512MB Render!
 SYS_SEARCH_TIMEOUT     = float(os.getenv("SYS_SEARCH_TIMEOUT", "15.0")) # Query search timeout in seconds
 SYS_MAX_QUEUE          = int(os.getenv("SYS_MAX_QUEUE",      "20"))     # Maximum search queue capacity
-SYS_HTTP_TIMEOUT_MS    = int(os.getenv("SYS_HTTP_TIMEOUT_MS", "15000")) # DuckDB remote parquet HTTP timeout (ms)
+SYS_HTTP_TIMEOUT_MS    = int(os.getenv("SYS_HTTP_TIMEOUT_MS", "60000")) # DuckDB remote parquet HTTP timeout (ms)
 SYS_HTTP_POOL_CONN     = int(os.getenv("SYS_HTTP_POOL_CONN", "25"))     # Telegram connection pool size
 SYS_HTTP_POOL_MAX      = int(os.getenv("SYS_HTTP_POOL_MAX",  "50"))     # Telegram connection pool maxsize
 
 # Concurrency semaphore for multi-source search worker
 _sys_lock = threading.Lock()
+_duckdb_applied_cfg: dict = {}
 _source_semaphore = threading.Semaphore(max(1, min(7, int(SYS_CONCURRENT_SOURCES))))
 
 def configure_system_settings(
@@ -90,7 +92,7 @@ def configure_system_settings(
         configure_system_settings(ram='300MB', threads=1, concurrent_sources=2)
     """
     global SYS_RAM_LIMIT, SYS_CPU_THREADS, SYS_CONCURRENT_SOURCES
-    global SYS_SEARCH_TIMEOUT, SYS_MAX_QUEUE, SYS_HTTP_TIMEOUT_MS, _source_semaphore
+    global SYS_SEARCH_TIMEOUT, SYS_MAX_QUEUE, SYS_HTTP_TIMEOUT_MS, _source_semaphore, _duckdb_applied_cfg
 
     with _sys_lock:
         if ram is not None:
@@ -107,14 +109,21 @@ def configure_system_settings(
         if http_timeout_ms is not None:
             SYS_HTTP_TIMEOUT_MS = max(1000, int(http_timeout_ms))
 
-        # Apply directly to DuckDB engine if initialized
-        try:
-            if "db" in globals() and db is not None:
-                db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS};")
-                log.info("✅ Manual system settings applied to DuckDB · RAM: %s, Threads: %d, Concurrent: %d",
-                         SYS_RAM_LIMIT, SYS_CPU_THREADS, SYS_CONCURRENT_SOURCES)
-        except Exception as exc:
-            log.warning("Notice on manual DuckDB tuning: %s", exc)
+        # Apply directly to DuckDB engine if initialized and values differ
+        target_cfg = {
+            "ram": SYS_RAM_LIMIT,
+            "threads": SYS_CPU_THREADS,
+            "http_timeout": SYS_HTTP_TIMEOUT_MS,
+        }
+        if "db" in globals() and db is not None:
+            if target_cfg != _duckdb_applied_cfg:
+                try:
+                    db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS};")
+                    _duckdb_applied_cfg = dict(target_cfg)
+                    log.info("✅ Manual system settings applied to DuckDB · RAM: %s, Threads: %d, Concurrent: %d",
+                             SYS_RAM_LIMIT, SYS_CPU_THREADS, SYS_CONCURRENT_SOURCES)
+                except Exception as exc:
+                    log.warning("Notice on manual DuckDB tuning: %s", exc)
 
     return {
         "ram_limit": SYS_RAM_LIMIT,
@@ -214,6 +223,11 @@ _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
 log.info("⏳ Initialising DuckDB connection …")
 db = duckdb.connect(config={"custom_user_agent": _UA})
 db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS}; SET enable_progress_bar=false;")
+_duckdb_applied_cfg = {
+    "ram": SYS_RAM_LIMIT,
+    "threads": SYS_CPU_THREADS,
+    "http_timeout": SYS_HTTP_TIMEOUT_MS,
+}
 db.execute("INSTALL httpfs; LOAD httpfs;")
 if HF_TOKEN and HF_TOKEN != "hf_YOUR_READ_TOKEN_HERE":
     try:
@@ -324,12 +338,27 @@ _VIEW_DEFS = [
     ),
 ]
 
+_VIEW_DICT = dict(_VIEW_DEFS)
+_SRC_VIEW_MAP = {
+    "main": "people_phone",
+    "umba": "people_umba",
+    "bsnl": "people_bsnl",
+    "cars": "people_cars",
+    "air": "people_air",
+    "flipkart": "people_flipkart",
+    "telegram": "people_telegram",
+}
+_view_health: dict[str, bool] = {}
+_source_query_error: dict[str, bool] = {}
+
 for vname, ddl in _VIEW_DEFS:
     try:
         db.execute(ddl)
+        _view_health[vname] = True
         log.info("✅ DuckDB view ready: %s", vname)
     except Exception as _ex:
-        log.warning("DuckDB view init notice (%s): %s", vname, _ex)
+        _view_health[vname] = False
+        log.warning("DuckDB view init notice (%s): %s (marked unhealthy)", vname, _ex)
 
 _db_lock = threading.RLock()
 
@@ -371,57 +400,123 @@ def _safe_query(sql: str, params: list, source_name: str = "") -> list[dict]:
     """Thread-safe query execution with cursor pooling and fallback lock."""
     try:
         cur = db.cursor()
-        res = _to_dicts(cur.execute(sql, params))
-        cur.close()
-        return res
-    except Exception:
+        try:
+            res = _to_dicts(cur.execute(sql, params))
+            if source_name:
+                _source_query_error[source_name] = False
+            return res
+        finally:
+            cur.close()
+    except Exception as ex:
         with _db_lock:
             try:
-                cur2 = db.cursor()
-                res = _to_dicts(cur2.execute(sql, params))
-                cur2.close()
-                return res
+                cur = db.cursor()
+                try:
+                    res = _to_dicts(cur.execute(sql, params))
+                    if source_name:
+                        _source_query_error[source_name] = False
+                    return res
+                finally:
+                    cur.close()
             except Exception as ex2:
-                log.warning("DuckDB query failed [%s]: %s", source_name or "DB", ex2)
+                if source_name:
+                    _source_query_error[source_name] = True
+                log.error("DuckDB query failed [%s]: %s (initial: %s)", source_name or "DB", ex2, ex)
                 return []
 
 def db_search_main(number: str) -> list[dict]:
+    vname = "people_phone"
+    if not _view_health.get(vname, True):
+        try:
+            db.execute(_VIEW_DICT[vname])
+            _view_health[vname] = True
+            log.info("DuckDB view %s recovered to True", vname)
+        except Exception as _ex:
+            log.warning("DuckDB view %s lazy recreate failed: %s", vname, _ex)
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_phone WHERE phoneNumber IN ({ph}) LIMIT 5"
     return _safe_query(sql, vars_list, "KC-SOURCE-01")
 
 def db_search_umba(number: str) -> list[dict]:
+    vname = "people_umba"
+    if not _view_health.get(vname, True):
+        try:
+            db.execute(_VIEW_DICT[vname])
+            _view_health[vname] = True
+            log.info("DuckDB view %s recovered to True", vname)
+        except Exception as _ex:
+            log.warning("DuckDB view %s lazy recreate failed: %s", vname, _ex)
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_umba WHERE phoneNumber IN ({ph}) LIMIT 5"
     return _safe_query(sql, vars_list, "KC-SOURCE-02")
 
 def db_search_bsnl(number: str) -> list[dict]:
+    vname = "people_bsnl"
+    if not _view_health.get(vname, True):
+        try:
+            db.execute(_VIEW_DICT[vname])
+            _view_health[vname] = True
+            log.info("DuckDB view %s recovered to True", vname)
+        except Exception as _ex:
+            log.warning("DuckDB view %s lazy recreate failed: %s", vname, _ex)
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_bsnl WHERE number IN ({ph}) LIMIT 5"
     return _safe_query(sql, vars_list, "KC-SOURCE-03")
 
 def db_search_cars(number: str) -> list[dict]:
+    vname = "people_cars"
+    if not _view_health.get(vname, True):
+        try:
+            db.execute(_VIEW_DICT[vname])
+            _view_health[vname] = True
+            log.info("DuckDB view %s recovered to True", vname)
+        except Exception as _ex:
+            log.warning("DuckDB view %s lazy recreate failed: %s", vname, _ex)
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_cars WHERE mobile_no IN ({ph}) LIMIT 5"
     return _safe_query(sql, vars_list, "KC-SOURCE-04")
 
 def db_search_air(number: str) -> list[dict]:
+    vname = "people_air"
+    if not _view_health.get(vname, True):
+        try:
+            db.execute(_VIEW_DICT[vname])
+            _view_health[vname] = True
+            log.info("DuckDB view %s recovered to True", vname)
+        except Exception as _ex:
+            log.warning("DuckDB view %s lazy recreate failed: %s", vname, _ex)
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_air WHERE number IN ({ph}) LIMIT 5"
     return _safe_query(sql, vars_list, "KC-SOURCE-05")
 
 def db_search_flipkart(number: str) -> list[dict]:
+    vname = "people_flipkart"
+    if not _view_health.get(vname, True):
+        try:
+            db.execute(_VIEW_DICT[vname])
+            _view_health[vname] = True
+            log.info("DuckDB view %s recovered to True", vname)
+        except Exception as _ex:
+            log.warning("DuckDB view %s lazy recreate failed: %s", vname, _ex)
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_flipkart WHERE phone IN ({ph}) LIMIT 5"
     return _safe_query(sql, vars_list, "KC-SOURCE-06")
 
 def db_search_telegram(number: str) -> list[dict]:
+    vname = "people_telegram"
+    if not _view_health.get(vname, True):
+        try:
+            db.execute(_VIEW_DICT[vname])
+            _view_health[vname] = True
+            log.info("DuckDB view %s recovered to True", vname)
+        except Exception as _ex:
+            log.warning("DuckDB view %s lazy recreate failed: %s", vname, _ex)
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_telegram WHERE phone IN ({ph}) LIMIT 5"
@@ -435,7 +530,7 @@ db_search = db_search_main
 # ═══════════════════════════════════════════════════════════════════════════════
 _sl = threading.RLock()
 user_data:      dict[int, dict] = {}
-user_sessions:  dict[int, dict] = {}
+user_sessions:  dict[tuple[int, int], dict] = {}
 active_users:   set[int]        = set()
 global_stats:   dict[str, int]  = {"searches": 0, "results": 0}
 flow:           dict[int, dict] = {}
@@ -447,7 +542,7 @@ _chan_fail:     set[str]        = set()
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SQLITE
 # ═══════════════════════════════════════════════════════════════════════════════
-_sql_lock = threading.Lock()
+_sql_lock = threading.RLock()
 _sql: sqlite3.Connection | None = None
 
 def _init_sqlite() -> None:
@@ -646,29 +741,32 @@ def _seed_settings() -> None:
 def _create_fresh_db() -> str | None:
     """Wipes the existing DB (if any) and creates a brand new one."""
     global _sql, MAINTENANCE
-    if _sql is not None:
+    with _sql_lock:
+        if _sql is not None:
+            try:
+                _sql.close()
+            except Exception:
+                pass
+            _sql = None
+        for side in (_DB_PATH, _DB_PATH + "-wal", _DB_PATH + "-shm"):
+            if os.path.isfile(side):
+                try:
+                    os.remove(side)
+                except OSError as exc:
+                    return f"Purani file delete nahi hui: {exc}. Host manually delete kar."
+                
         try:
-            _sql.close()
-        except Exception:
-            pass
-    if os.path.isfile(_DB_PATH):
-        try:
-            os.remove(_DB_PATH)
-        except OSError as exc:
-            return f"Purani file delete nahi hui: {exc}. Host manually delete kar."
-            
-    try:
-        _sql = sqlite3.connect(_DB_PATH, check_same_thread=False)
-        _sql.row_factory = sqlite3.Row
-        _init_sqlite()
-        _seed_settings()
-        MAINTENANCE = False
-        log.info("✅ Fresh SQLite DB created by admin request")
-        return None
-    except Exception as exc:
-        log.exception("Failed to create fresh DB")
-        MAINTENANCE = True
-        return f"Fresh DB banane mein error aaya: {exc}"
+            _sql = sqlite3.connect(_DB_PATH, check_same_thread=False)
+            _sql.row_factory = sqlite3.Row
+            _init_sqlite()
+            _seed_settings()
+            MAINTENANCE = False
+            log.info("✅ Fresh SQLite DB created by admin request")
+            return None
+        except Exception as exc:
+            log.exception("Failed to create fresh DB")
+            MAINTENANCE = True
+            return f"Fresh DB banane mein error aaya: {exc}"
 
 def _bootstrap_sqlite() -> None:
     global _sql, MAINTENANCE
@@ -881,13 +979,14 @@ def _expiry_loop() -> None:
             key = f"expnote:{cid}:{int(until)}"
             if _kv_get(key, ""):
                 continue
-            send_msg(
+            mid = send_msg(
                 cid,
                 "Bhai yaad rakh, tera premium <b>" + _e(fmt_until(until))
                 + "</b> ke aas-paas khatam ho raha hai — lagbhag 24 ghante baaki hain. "
                 "Renew kar le, warna lookups ruk jayenge.",
             )
-            _kv_set(key, "1")
+            if mid:
+                _kv_set(key, "1")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  QUEUE STATE
@@ -1136,7 +1235,6 @@ def _channel_link(ch: str) -> str | None:
     s = str(ch).strip()
     if s.startswith(("http://", "https://")): return s
     if s.startswith("@"): return "https://t.me/" + s[1:]
-    if re.fullmatch(r"-100\d+", s): return "https://t.me/c/" + s[4:]
     return None
 
 def _member_of(cid: int, channel: str) -> bool:
@@ -2194,18 +2292,19 @@ def _handle_stars_paid(msg: dict) -> None:
     payload = str(sp.get("invoice_payload") or "")
     plan_id = payload.split("|", 1)[0].strip()
     charge = str(sp.get("telegram_payment_charge_id") or "")
+    if not charge:
+        charge = f"stars:{cid}:{sp.get('telegram_payment_charge_id') or uuid.uuid4().hex[:8]}"
     stars_paid = int(sp.get("total_amount") or 0)
     plan = _plans().get(plan_id)
     if _sql is None:
         send_msg(cid, "Bhai Telegram ne payment confirm kar di, par DB maintenance mein hai. Admin ko pakad.")
         send_msg(ADMIN_ID, f"Stars payment maintenance ke time. user <code>{cid}</code> charge <code>{_e(charge)}</code>")
         return
-    if charge:
-        with _sql_lock:
-            exist = _sql.execute("SELECT id FROM payments WHERE utr = ?", (charge,)).fetchone()
-        if exist:
-            send_msg(cid, "Bhai ye Stars payment pehle se file pe hai.")
-            return
+    with _sql_lock:
+        exist = _sql.execute("SELECT id FROM payments WHERE utr = ?", (charge,)).fetchone()
+    if exist:
+        send_msg(cid, "Bhai ye Stars payment pehle se file pe hai.")
+        return
     if not plan:
         send_msg(cid, "Bhai payment aa gayi par plan pehchaan nahi paya. Admin dekh lega.")
         send_msg(ADMIN_ID, f"Stars plan missing <code>{_e(plan_id)}</code> user <code>{cid}</code>")
@@ -2228,7 +2327,7 @@ def _handle_stars_paid(msg: dict) -> None:
             "VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, 'Stars', ?)",
             (
                 payment_id, cid, plan["id"], plan["name"], int(plan["amount"]),
-                int(plan["days"]), charge or payment_id, time.time(), time.time(), inv,
+                int(plan["days"]), charge, time.time(), time.time(), inv,
             ),
         )
         _sql.commit()
@@ -2239,7 +2338,7 @@ def _handle_stars_paid(msg: dict) -> None:
         f"👑 <b>Premium khul gaya.</b>\n\nStars se {_e(plan['name'])} lag gaya. "
         f"Chalega <b>{_e(expiry)}</b> tak.\nInvoice · <code>{_e(inv)}</code>",
     )
-    send_receipt(cid, snapshot, plan, when, expiry, charge or payment_id, "Stars", inv)
+    send_receipt(cid, snapshot, plan, when, expiry, charge, "Stars", inv)
     send_msg(ADMIN_ID, f"Stars payment paid · <code>{_e(inv)}</code> · <code>{cid}</code> · {_e(plan['name'])} · {stars_paid} stars")
     _poke_desks()
 
@@ -2250,15 +2349,27 @@ def _present_spin(cid: int, pending: str | None) -> None:
     with _sl:
         user = _get_ud(cid)
         text = msg_spin(user, pending)
-    flow[cid] = {"mode": "spin", "pending_query": pending}
+    curr = flow.get(cid) or {}
+    pq = curr.get("pending_query")
+    p_list = list(curr.get("pending_queries") or ([] if not pq else [pq]))
+    if pending:
+        if not pq:
+            pq = pending
+            p_list = [pending]
+        elif pending != pq and pending not in p_list:
+            p_list.append(pending)
+    flow[cid] = {"mode": "spin", "pending_query": pq, "pending_queries": p_list}
     kb = [[{"text": "🎰 Spin Maar", "callback_data": "spin"}]] if _spin_due(user) else back_kb()
     send_msg(cid, text, kb=kb)
 
 def _finish_spin(cid: int, value: int) -> None:
-    pending = None
+    pending_list = []
     state = flow.get(cid) or {}
     if state.get("mode") == "spin":
-        pending = state.get("pending_query")
+        if state.get("pending_queries"):
+            pending_list = [q for q in state["pending_queries"] if q]
+        elif state.get("pending_query"):
+            pending_list = [state["pending_query"]]
     _clear_flow(cid)
     with _sl:
         user = _get_ud(cid)
@@ -2278,8 +2389,22 @@ def _finish_spin(cid: int, value: int) -> None:
             prize_line = f"Reels pe <b>{value}</b> aaya. Is baar kuch extra nahi. Agli window <b>{_e(_countdown())}</b> mein."
         _save_user(user)
     send_msg(cid, f"🎰 <b>Spin khatam.</b>\n\n{prize_line}\n\n{_D}", kb=dashboard_kb())
-    if pending and pending.isdigit() and len(pending) == 10:
-        _enqueue_search(cid, pending)
+    if pending_list:
+        if len(pending_list) == 1:
+            q = pending_list[0]
+            if q and q.isdigit() and len(q) == 10:
+                _enqueue_search(cid, q)
+        else:
+            def _run_pending_seq(c_id: int, q_list: list[str]):
+                for q in q_list:
+                    if q and q.isdigit() and len(q) == 10:
+                        while True:
+                            with _sl:
+                                if c_id not in active_users:
+                                    break
+                            time.sleep(0.5)
+                        _enqueue_search(c_id, q)
+            threading.Thread(target=_run_pending_seq, args=(cid, pending_list), daemon=True).start()
 
 def _run_spin(cid: int) -> None:
     with _sl:
@@ -2305,7 +2430,7 @@ def _broadcast(audience: str, text: str) -> None:
     with _sql_lock:
         if audience == "prem":
             rows = _sql.execute(
-                "SELECT chat_id FROM users WHERE is_premium = 1 AND premium_until > ? AND COALESCE(is_banned, 0) = 0",
+                "SELECT chat_id FROM users WHERE is_premium = 1 AND premium_until > ?",
                 (now,),
             ).fetchall()
         else:
@@ -2796,7 +2921,7 @@ def _desk_nav(cid: int) -> list:
     row: list = []
     rows: list = []
     for key in _desk_sections(cid):
-        row.append({"text": labels[key], "callback_data": f"d:{key}"})
+        row.append({"text": labels[key], "callback_data": f"d:key".replace("key", key)})
         if len(row) == 2:
             rows.append(row); row = []
     if row:
@@ -3199,8 +3324,9 @@ def _cmd_data(cid: int) -> None:
         send_msg(cid, "Bhai ticket gayab hai.")
         return
     if row["status"] == "claimed" and int(row["agent_id"] or 0) != cid:
-        send_msg(cid, "Bhai ye ticket doosre agent pe lock hai. Interfere nahi chalega. /removerole ke baad super admin dekh sakta hai.")
-        return
+        if not (cid == ADMIN_ID or _db_role(cid) == "SUPER_ADMIN"):
+            send_msg(cid, "Bhai ye ticket doosre agent pe lock hai. Interfere nahi chalega. /removerole ke baad super admin dekh sakta hai.")
+            return
     user = _load_user(int(row["chat_id"]))
     if user is None:
         send_msg(cid, "Bhai jisne ticket kholi woh file pe nahi mila.")
@@ -3383,17 +3509,17 @@ def worker() -> None:
                         try:
                             all_sources[src_def["id"]] = src_def["search_fn"](query)
                         except Exception as ex:
-                            log.warning("%s query error: %s", src_def["name"], ex)
+                            log.warning("Source %s query error: %s", src_def["id"], ex)
                             all_sources[src_def["id"]] = []
                 return _fetch
 
-            timeout_secs = float(SYS_SEARCH_TIMEOUT)
+            deadline = time.monotonic() + SYS_SEARCH_TIMEOUT
             t_db = time.monotonic()
             threads = [
-                threading.Thread(target=_make_fetcher(s), daemon=True)
+                (s, threading.Thread(target=_make_fetcher(s), daemon=True))
                 for s in SOURCES
             ]
-            for th in threads:
+            for _, th in threads:
                 th.start()
 
             # Display quick animated hacker stages
@@ -3401,8 +3527,12 @@ def worker() -> None:
                 time.sleep(_STAGE_GAP)
                 edit_msg(cid, mid, msg_stage(query, label))
 
-            for th in threads:
-                th.join(timeout=timeout_secs)
+            for s, th in threads:
+                remaining = max(0.0, deadline - time.monotonic())
+                th.join(remaining)
+                if th.is_alive():
+                    log.warning("Source %s query timed out", s["id"])
+                    all_sources[s["id"]] = []
 
             elapsed = time.monotonic() - t_db
 
@@ -3424,7 +3554,7 @@ def worker() -> None:
                     if cid in user_data:
                         user_data[cid]["results"] += total_found
                     _remember(cid, query, total_found)
-                    user_sessions[cid] = {
+                    user_sessions[(cid, mid)] = {
                         "sources":      all_sources,
                         "results":      all_sources.get("main", []),
                         "results_umba": all_sources.get("umba", []),
@@ -3451,13 +3581,19 @@ def worker() -> None:
                 active_users.discard(cid)
             _search_q.task_done()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  QUEUE BROADCASTER & GC
-# ═══════════════════════════════════════════════════════════════════════════════
 def _broadcaster() -> None:
     while True:
         time.sleep(QUEUE_BROADCAST_IV)
+        now = time.time()
         with _ql:
+            kept = []
+            for item in _queue_order:
+                enq = float(item.get("enqueued_at") or now)
+                if now - enq > 90:
+                    log.warning("Dropping stale queue entry for cid %s (older than 90s)", item.get("chat_id"))
+                else:
+                    kept.append(item)
+            _queue_order[:] = kept
             snapshot = list(_queue_order)
         for i, item in enumerate(snapshot, start=1):
             try:
@@ -3470,9 +3606,9 @@ def _session_gc() -> None:
         time.sleep(GC_INTERVAL)
         cutoff = time.time() - SESSION_TTL
         with _sl:
-            stale = [cid for cid, s in user_sessions.items() if s["ts"] < cutoff]
-            for cid in stale:
-                del user_sessions[cid]
+            stale = [key for key, s in user_sessions.items() if s["ts"] < cutoff]
+            for key in stale:
+                del user_sessions[key]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ADMIN UTILITIES
@@ -3497,68 +3633,57 @@ def _enqueue_search(cid: int, query: str) -> None:
         send_msg(cid, _MAINT_TEXT)
         return
     with _sl:
-        if cid in active_users:
-            busy = True
-            user = user_data.get(cid) or _get_ud(cid)
-        else:
-            busy = False
-            user = _get_ud(cid)
+        user = user_data.get(cid) or _get_ud(cid)
         banned = cid != ADMIN_ID and int(user.get("is_banned") or 0) == 1
-    if banned:
-        send_msg(cid, _BAN_TEXT)
-        return
-    if busy:
-        send_msg(cid, "Arre ruk bhai, teri pehli search abhi desk pe hai.")
-        return
-    if _touch_streak(cid):
-        send_msg(cid, "🔥 Bhai streak complete! Tere ko 1 free lookup mil gaya.")
-    counted = False
-    if cid != ADMIN_ID and not _premium_active(user):
-        today = _today()
-        with _sl:
-            user = _get_ud(cid)
+        if banned:
+            send_msg(cid, _BAN_TEXT)
+            return
+        if cid in active_users:
+            send_msg(cid, "Arre ruk bhai, teri pehli search abhi desk pe hai.")
+            return
+
+        if _touch_streak(cid):
+            send_msg(cid, "🔥 Bhai streak complete! Tere ko 1 free lookup mil gaya.")
+        counted = False
+        if cid != ADMIN_ID and not _premium_active(user):
+            today = _today()
             if user.get("last_search_date") != today:
                 user["daily_searches"] = 0
             allowance = _free_limit() + _bonus_today(cid)
             used = int(user.get("daily_searches") or 0)
             if used >= allowance:
-                blocked = True
                 _save_user(user)
-            else:
-                blocked = False
-                counted = True
-                user["daily_searches"] = used + 1
-                user["last_search_date"] = today
+                send_msg(cid, msg_limit(user), kb=[[{"text": "👑 Premium Pass", "callback_data": "premium"}]])
+                return
+            counted = True
+            user["daily_searches"] = used + 1
+            user["last_search_date"] = today
+            _save_user(user)
+
+        if _search_q.qsize() >= SYS_MAX_QUEUE:
+            if counted:
+                user["daily_searches"] = max(0, int(user.get("daily_searches") or 0) - 1)
                 _save_user(user)
-        if blocked:
-            send_msg(cid, msg_limit(user), kb=[[{"text": "👑 Premium Pass", "callback_data": "premium"}]])
+            send_msg(cid, "Desk full hai bhai. Ek minute ruk, phir number bhej.")
             return
-    if _search_q.qsize() >= SYS_MAX_QUEUE:
-        if counted:
-            with _sl:
-                user = user_data.get(cid)
-                if user:
-                    user["daily_searches"] = max(0, int(user.get("daily_searches") or 0) - 1)
-                    _save_user(user)
-        send_msg(cid, "Desk full hai bhai. Ek minute ruk, phir number bhej.")
-        return
-    with _sl:
+
         active_users.add(cid)
         if cid in user_data:
             user_data[cid]["last_search"] = time.time()
-    with _ql:
-        approx_pos = len(_queue_order) + 1
-    mid = send_msg(cid, msg_queue(approx_pos, query))
-    if not mid:
-        with _sl:
+        with _ql:
+            approx_pos = len(_queue_order) + 1
+
+        mid = send_msg(cid, msg_queue(approx_pos, query))
+        if not mid:
             active_users.discard(cid)
-            if counted and cid in user_data:
-                user_data[cid]["daily_searches"] = max(0, int(user_data[cid].get("daily_searches") or 0) - 1)
-                _save_user(user_data[cid])
-        return
-    with _ql:
-        _queue_order.append({"chat_id": cid, "msg_id": mid, "query": query})
-    _search_q.put((cid, query, mid))
+            if counted:
+                user["daily_searches"] = max(0, int(user.get("daily_searches") or 0) - 1)
+                _save_user(user)
+            return
+
+        with _ql:
+            _queue_order.append({"chat_id": cid, "msg_id": mid, "query": query, "enqueued_at": time.time()})
+        _search_q.put((cid, query, mid))
 
 def _maybe_spin(cid: int, raw: str) -> bool:
     is_num = raw.isdigit() and len(raw) == 10
@@ -3791,6 +3916,10 @@ def handle_cb(cb: dict) -> None:
             send_msg(cid, "Broadcast nahi kiya. Price file pe update hai.")
         return
 
+    if data == "noop":
+        send_msg(cid, "Private channel hai — admin se public invite link le.")
+        return
+
     if data == "paycancel":
         _clear_flow(cid)
         desk_edit(cid, mid, "Payment cancel kar diya bhai. Jab mann kare number daal.", kb=dashboard_kb())
@@ -3848,7 +3977,7 @@ def handle_cb(cb: dict) -> None:
             text = msg_history(user)
         desk_edit(cid, mid, text, kb=back_kb())
     elif data == "support":
-        flow[cid] = {"mode": "WAITING_FOR_SUPPORT"}
+        flow[cid] = {"mode": "WAITING_FOR_SUPPORT", "ts": time.time()}
         desk_edit(cid, mid, msg_support_prompt(), kb=back_kb())
     elif data in {"search", "new_search"}:
         _clear_flow(cid)
@@ -3901,74 +4030,88 @@ def handle_cb(cb: dict) -> None:
         desk_edit(cid, mid, f"Agla message bhej. Ye <b>{who}</b> ke paas jayega.\n\n/cancel se ye band.")
     elif data.startswith("pg:"):
         page = int(data.split(":")[1])
+        cb_mid = cb["message"]["message_id"]
         with _sl:
-            sess = user_sessions.get(cid)
-        if sess:
-            sources = sess.get("sources")
-            if sources:
-                max_pages = max([len(r) for r in sources.values() if r] or [0])
-                if 0 <= page < max_pages:
-                    page_data = {k: (v[page] if page < len(v) else None) for k, v in sources.items()}
-                    edit_msg(
-                        cid, mid,
-                        format_card_sources(page_data, sess["query"]),
-                        kb=result_kb(page, max_pages),
-                    )
-            else:
-                rows_main = sess.get("results", [])
-                rows_umba = sess.get("results_umba", [])
-                total = max(len(rows_main), len(rows_umba))
-                if 0 <= page < total:
-                    row_main = rows_main[page] if page < len(rows_main) else None
-                    row_umba = rows_umba[page] if page < len(rows_umba) else None
-                    edit_msg(
-                        cid, mid,
-                        format_card_combined(row_main, row_umba, sess["query"]),
-                        kb=result_kb(page, total),
-                    )
+            sess = user_sessions.get((cid, cb_mid))
+            if not sess:
+                cid_matches = [s for k, s in user_sessions.items() if k[0] == cid]
+                if len(cid_matches) == 1:
+                    sess = cid_matches[0]
+        if not sess:
+            send_msg(cid, "Session expire ho gaya, nayi search kar.", kb=back_kb())
+            return
+        sources = sess.get("sources")
+        if sources:
+            max_pages = max([len(r) for r in sources.values() if r] or [0])
+            if 0 <= page < max_pages:
+                page_data = {k: (v[page] if page < len(v) else None) for k, v in sources.items()}
+                edit_msg(
+                    cid, mid,
+                    format_card_sources(page_data, sess["query"]),
+                    kb=result_kb(page, max_pages),
+                )
+        else:
+            rows_main = sess.get("results", [])
+            rows_umba = sess.get("results_umba", [])
+            total = max(len(rows_main), len(rows_umba))
+            if 0 <= page < total:
+                row_main = rows_main[page] if page < len(rows_main) else None
+                row_umba = rows_umba[page] if page < len(rows_umba) else None
+                edit_msg(
+                    cid, mid,
+                    format_card_combined(row_main, row_umba, sess["query"]),
+                    kb=result_kb(page, total),
+                )
 
     elif data.startswith("html:"):
         page = int(data.split(":")[1])
+        cb_mid = cb["message"]["message_id"]
         with _sl:
-            sess = user_sessions.get(cid)
-        if sess:
-            query = sess["query"]
-            sources = sess.get("sources")
-            if sources:
-                page_data = {k: (v[page] if page < len(v) else (v[0] if v else None)) for k, v in sources.items()}
+            sess = user_sessions.get((cid, cb_mid))
+            if not sess:
+                cid_matches = [s for k, s in user_sessions.items() if k[0] == cid]
+                if len(cid_matches) == 1:
+                    sess = cid_matches[0]
+        if not sess:
+            send_msg(cid, "Session expire ho gaya, nayi search kar.", kb=back_kb())
+            return
+        query = sess["query"]
+        sources = sess.get("sources")
+        if sources:
+            page_data = {k: (v[page] if page < len(v) else (v[0] if v else None)) for k, v in sources.items()}
+            phone = (
+                sv((page_data.get("main") or {}).get("phoneNumber"))
+                or sv((page_data.get("umba") or {}).get("phoneNumber"))
+                or sv((page_data.get("bsnl") or {}).get("number"))
+                or sv((page_data.get("cars") or {}).get("mobile_no"))
+                or sv((page_data.get("air") or {}).get("number"))
+                or sv((page_data.get("flipkart") or {}).get("phone"))
+                or sv((page_data.get("telegram") or {}).get("phone"))
+                or query
+            )
+            send_html_file(
+                cid,
+                f"{BOT_NAME}_Report_{phone}.html",
+                generate_html_all(page_data, query),
+                "📄 Le bhai, teri KC multi-source intelligence report attach hai.",
+            )
+        else:
+            rows_main = sess.get("results", [])
+            rows_umba = sess.get("results_umba", [])
+            row_main = rows_main[page] if page < len(rows_main) else None
+            row_umba = rows_umba[page] if page < len(rows_umba) else None
+            if row_main is not None or row_umba is not None:
                 phone = (
-                    sv((page_data.get("main") or {}).get("phoneNumber"))
-                    or sv((page_data.get("umba") or {}).get("phoneNumber"))
-                    or sv((page_data.get("bsnl") or {}).get("number"))
-                    or sv((page_data.get("cars") or {}).get("mobile_no"))
-                    or sv((page_data.get("air") or {}).get("number"))
-                    or sv((page_data.get("flipkart") or {}).get("phone"))
-                    or sv((page_data.get("telegram") or {}).get("phone"))
-                    or query
+                    sv((row_main or {}).get("phoneNumber"))
+                    or sv((row_umba or {}).get("phoneNumber"))
+                    or "note"
                 )
                 send_html_file(
                     cid,
                     f"{BOT_NAME}_Report_{phone}.html",
-                    generate_html_all(page_data, query),
-                    "📄 Le bhai, teri KC multi-source intelligence report attach hai.",
+                    generate_html_combined(row_main, row_umba, query),
+                    "📄 Le bhai, teri KC directory note attach hai.",
                 )
-            else:
-                rows_main = sess.get("results", [])
-                rows_umba = sess.get("results_umba", [])
-                row_main = rows_main[page] if page < len(rows_main) else None
-                row_umba = rows_umba[page] if page < len(rows_umba) else None
-                if row_main is not None or row_umba is not None:
-                    phone = (
-                        sv((row_main or {}).get("phoneNumber"))
-                        or sv((row_umba or {}).get("phoneNumber"))
-                        or "note"
-                    )
-                    send_html_file(
-                        cid,
-                        f"{BOT_NAME}_Report_{phone}.html",
-                        generate_html_combined(row_main, row_umba, query),
-                        "📄 Le bhai, teri KC directory note attach hai.",
-                    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  COMMAND DISPATCH
@@ -4107,13 +4250,6 @@ def handle_msg(msg: dict) -> None:
         send_msg(cid, _MAINT_TEXT)
         return
 
-    if cid == ADMIN_ID and msg.get("reply_to_message") and raw:
-        target = support_routes.get(msg["reply_to_message"].get("message_id"))
-        if target:
-            send_msg(target, f"<b>Desk se jawab</b>\n\n{_e(raw)}")
-            send_msg(cid, "Member ke paas pahunch gaya.")
-            return
-
     state = flow.get(cid) or {}
     mode = state.get("mode")
 
@@ -4220,17 +4356,22 @@ def handle_msg(msg: dict) -> None:
         return
 
     if mode == "WAITING_FOR_SUPPORT":
-        if not raw:
-            send_msg(cid, "Bhai khali message se ticket nahi khulta. Likh ke bhej.")
+        if time.time() - float(state.get("ts") or 0) > 300:
+            _clear_flow(cid)
+            state = {}
+            mode = None
+        else:
+            if not raw:
+                send_msg(cid, "Bhai khali message se ticket nahi khulta. Likh ke bhej.")
+                return
+            if _sql is None:
+                send_msg(cid, _MAINT_TEXT)
+                return
+            tid = _open_ticket(cid, raw)
+            _clear_flow(cid)
+            send_msg(cid, f"Ticket <b>#{tid}</b> khul gaya bhai. Agent claim karega, jawab yahin aayega.", kb=dashboard_kb())
+            _poke_desks()
             return
-        if _sql is None:
-            send_msg(cid, _MAINT_TEXT)
-            return
-        tid = _open_ticket(cid, raw)
-        _clear_flow(cid)
-        send_msg(cid, f"Ticket <b>#{tid}</b> khul gaya bhai. Agent claim karega, jawab yahin aayega.", kb=dashboard_kb())
-        _poke_desks()
-        return
 
     if _guard_join(cid):
         return
@@ -4252,7 +4393,7 @@ def handle_msg(msg: dict) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 def poll_telegram() -> None:
     try:
-        _session.get(f"{BASE_URL}/deleteWebhook?drop_pending_updates=true", timeout=5)
+        _session.get(f"{BASE_URL}/deleteWebhook?drop_pending_updates=false", timeout=5)
     except Exception:
         pass
     offset, backoff = None, 1
@@ -4293,12 +4434,27 @@ def _startup_health() -> None:
     if _sql is None or not os.path.isfile(_DB_PATH):
         MAINTENANCE = True
         reasons.append("users.db missing hai. /restore se file daal, ya /initdb se fresh start kar.")
-    try:
-        db_search("7417679558")
-    except Exception as exc:
+
+    test_num = "7417679558"
+    failed_count = 0
+    for src in SOURCES:
+        s_id = src["id"]
+        vname = _SRC_VIEW_MAP.get(s_id, "")
+        try:
+            res = src["search_fn"](test_num)
+            if (vname and not _view_health.get(vname, True)) or _source_query_error.get(src["name"], False):
+                failed_count += 1
+                log.warning("Startup health %s (%s): FAIL", s_id, src["name"])
+            else:
+                log.info("Startup health %s (%s): PASS", s_id, src["name"])
+        except Exception as exc:
+            failed_count += 1
+            log.warning("Startup health %s (%s): FAIL (%s)", s_id, src["name"], exc)
+
+    if failed_count >= 5:
         MAINTENANCE = True
-        reasons.append("DuckDB test number 7417679558 fail: " + str(exc))
-        log.exception("startup duckdb health failed")
+        reasons.append(f"DuckDB multi-source health check failed ({failed_count}/7 sources failed)")
+
     if reasons:
         MAINTENANCE = True
         try:
@@ -4318,6 +4474,5 @@ if __name__ == "__main__":
         import uvicorn
         uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")), log_level="info")
     except Exception:
-        log.exception("http server failed, parking process")
-        while True:
-            time.sleep(3600)
+        log.exception("http server failed, exiting process")
+        sys.exit(1)
