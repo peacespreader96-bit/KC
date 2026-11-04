@@ -59,6 +59,131 @@ DUCKDB_MEM_LIMIT = os.getenv("DUCKDB_MEM_LIMIT", "500MB")
 DUCKDB_THREADS   = int(os.getenv("DUCKDB_THREADS", "4"))
 BASE_URL         = f"https://api.telegram.org/bot{TOKEN}"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURABLE SYSTEM TUNING ARCHITECTURE (RAM, THREADS, CONCURRENCY, PROFILES)
+# ═══════════════════════════════════════════════════════════════════════════════
+SYS_PROFILES = {
+    "eco": {
+        "name": "Eco / Low-RAM (512MB Render / Cloud Free Tier)",
+        "ram": "300MB",
+        "threads": 1,
+        "concurrent": 2,
+        "timeout": 12,
+        "queue": 10,
+    },
+    "standard": {
+        "name": "Standard (1GB - 2GB RAM / Balanced Default)",
+        "ram": "500MB",
+        "threads": 2,
+        "concurrent": 4,
+        "timeout": 15,
+        "queue": 25,
+    },
+    "performance": {
+        "name": "Turbo / High-Performance (4GB+ RAM / Dedicated)",
+        "ram": "1500MB",
+        "threads": 4,
+        "concurrent": 7,
+        "timeout": 20,
+        "queue": 50,
+    },
+}
+
+_INITIAL_PROFILE = os.getenv("SYS_PROFILE", "standard").lower().strip()
+if _INITIAL_PROFILE not in SYS_PROFILES:
+    _INITIAL_PROFILE = "standard"
+
+# Dynamic Concurrency Controller
+_sys_lock = threading.Lock()
+_current_concurrent_sources = int(os.getenv("MAX_CONCURRENT_SOURCES", str(SYS_PROFILES[_INITIAL_PROFILE]["concurrent"])))
+_source_semaphore = threading.Semaphore(max(1, min(7, _current_concurrent_sources)))
+
+def get_source_semaphore() -> threading.Semaphore:
+    return _source_semaphore
+
+def update_source_semaphore(n: int) -> None:
+    global _current_concurrent_sources, _source_semaphore
+    with _sys_lock:
+        n = max(1, min(7, int(n)))
+        _current_concurrent_sources = n
+        _source_semaphore = threading.Semaphore(n)
+        log.info("Max concurrent sources tuned to: %d", n)
+
+def get_sys_profile_name() -> str:
+    p = _kv_get("sys:profile", "").lower().strip()
+    if p in SYS_PROFILES:
+        return p
+    return _INITIAL_PROFILE
+
+def get_sys_config(param: str, default: str = "") -> str:
+    """Reads setting from SQLite KV first, then environment variable, then active profile, then default."""
+    val = _kv_get(f"sys:{param}", "").strip()
+    if val:
+        return val
+    env_keys = [
+        f"SYS_{param.upper()}",
+        f"DUCKDB_{param.upper()}",
+        param.upper(),
+        f"MAX_{param.upper()}",
+    ]
+    for ek in env_keys:
+        ev = os.getenv(ek, "").strip()
+        if ev:
+            return ev
+    prof = SYS_PROFILES.get(get_sys_profile_name(), SYS_PROFILES["standard"])
+    if param in prof:
+        return str(prof[param])
+    return default
+
+def get_sys_config_int(param: str, default: int) -> int:
+    try:
+        return int(get_sys_config(param, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+def set_sys_config(param: str, val: str) -> None:
+    _kv_set(f"sys:{param}", str(val).strip())
+    _apply_live_system_tuning()
+
+def apply_sys_profile(pname: str) -> bool:
+    pname = pname.lower().strip()
+    if pname not in SYS_PROFILES:
+        return False
+    _kv_set("sys:profile", pname)
+    prof = SYS_PROFILES[pname]
+    _kv_set("sys:ram", str(prof["ram"]))
+    _kv_set("sys:threads", str(prof["threads"]))
+    _kv_set("sys:concurrent", str(prof["concurrent"]))
+    _kv_set("sys:timeout", str(prof["timeout"]))
+    _kv_set("sys:queue", str(prof["queue"]))
+    _apply_live_system_tuning()
+    return True
+
+def _apply_live_system_tuning() -> None:
+    ram = get_sys_config("ram", "500MB")
+    threads = get_sys_config_int("threads", 2)
+    concurrent = get_sys_config_int("concurrent", 4)
+    update_source_semaphore(concurrent)
+    try:
+        db.execute(f"SET memory_limit='{ram}';")
+        db.execute(f"SET threads={threads};")
+        log.info("✅ Live system tuning applied · DuckDB RAM: %s, Threads: %d, Concurrent: %d", ram, threads, concurrent)
+    except Exception as exc:
+        log.warning("Notice on live DuckDB tuning: %s", exc)
+
+def get_all_sys_config() -> dict:
+    prof_name = get_sys_profile_name()
+    prof_info = SYS_PROFILES.get(prof_name, SYS_PROFILES["standard"])
+    return {
+        "profile": prof_name,
+        "profile_label": prof_info["name"],
+        "ram": get_sys_config("ram", prof_info["ram"]),
+        "threads": get_sys_config_int("threads", prof_info["threads"]),
+        "concurrent": get_sys_config_int("concurrent", prof_info["concurrent"]),
+        "timeout": get_sys_config_int("timeout", prof_info["timeout"]),
+        "queue": get_sys_config_int("queue", prof_info["queue"]),
+    }
+
 FORCE_CHANNELS: list[str] = []
 _fc_env = os.getenv("FORCE_CHANNELS", "").strip()
 if _fc_env:
@@ -2287,8 +2412,100 @@ def admin_stats_text() -> str:
         f"Pending invoices · <b>{pend}</b>\n"
         f"Total searches · <b>{searches}</b>\n"
         f"Free limit · <b>{_free_limit()}</b>\n\n"
-        f"Commands · /dashboard /grant /ban /unban /userinfo /assignrole /removerole /role /setlimit /editplan /payments /restore /broadcast /csv /logs"
+        f"Commands · /dashboard /sysconfig /grant /ban /unban /userinfo /assignrole /removerole /role /setlimit /editplan /payments /restore /broadcast /csv /logs"
     )
+
+def _cmd_sysconfig(cid: int, raw: str) -> None:
+    parts = raw.split()
+    if len(parts) == 1:
+        cfg = get_all_sys_config()
+        text = (
+            "<b>⚙️ Configurable System Architecture & Tuning</b>\n"
+            "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"🏷 <b>Active Profile:</b> <code>{_e(cfg['profile'].upper())}</code>\n"
+            f"ℹ️ <i>{_e(cfg['profile_label'])}</i>\n\n"
+            f"🧠 <b>DuckDB RAM Limit:</b> <code>{_e(cfg['ram'])}</code>\n"
+            f"⚡ <b>DuckDB CPU Threads:</b> <code>{cfg['threads']}</code>\n"
+            f"🚦 <b>Max Concurrent Sources:</b> <code>{cfg['concurrent']} / 7</code>\n"
+            f"⏱ <b>Query Timeout:</b> <code>{cfg['timeout']}s</code>\n"
+            f"📥 <b>Search Queue Limit:</b> <code>{cfg['queue']}</code>\n\n"
+            "<b>🛠️ Quick Tuning Commands:</b>\n"
+            "• <code>/sysconfig profile eco</code> (512MB RAM / Render free tier)\n"
+            "• <code>/sysconfig profile standard</code> (1GB-2GB RAM / Balanced)\n"
+            "• <code>/sysconfig profile performance</code> (4GB+ RAM / Turbo)\n\n"
+            "<b>Custom Overrides:</b>\n"
+            "• <code>/sysconfig ram 350MB</code> (Set DuckDB memory)\n"
+            "• <code>/sysconfig threads 2</code> (Set DuckDB threads)\n"
+            "• <code>/sysconfig concurrent 3</code> (Set parallel sources)\n"
+            "• <code>/sysconfig timeout 15</code> (Set search timeout in seconds)\n"
+            "• <code>/sysconfig queue 20</code> (Set queue capacity)\n"
+            f"• <code>/sysconfig reset</code> (Restore profile defaults)\n\n{_D}"
+        )
+        send_msg(cid, text)
+        return
+
+    sub = parts[1].lower()
+    if sub == "profile":
+        if len(parts) < 3:
+            send_msg(cid, "Format: /sysconfig profile eco|standard|performance")
+            return
+        pname = parts[2].lower()
+        if apply_sys_profile(pname):
+            prof = SYS_PROFILES[pname]
+            send_msg(
+                cid,
+                f"✅ Profile <b>{_e(pname.upper())}</b> lag gaya!\n\n"
+                f"• Label: {_e(prof['name'])}\n"
+                f"• RAM: <code>{prof['ram']}</code>\n"
+                f"• Threads: <code>{prof['threads']}</code>\n"
+                f"• Concurrent Sources: <code>{prof['concurrent']}</code>\n"
+                f"• Timeout: <code>{prof['timeout']}s</code>\n"
+                f"• Queue: <code>{prof['queue']}</code>"
+            )
+        else:
+            send_msg(cid, "Bhai profile sirf 'eco', 'standard', ya 'performance' ho sakti hai.")
+        return
+
+    if sub == "reset":
+        pname = get_sys_profile_name()
+        apply_sys_profile(pname)
+        send_msg(cid, f"✅ System settings profile <b>{_e(pname.upper())}</b> defaults pe reset ho gaye.")
+        return
+
+    if len(parts) < 3:
+        send_msg(cid, "Format: /sysconfig [ram|threads|concurrent|timeout|queue] [value]")
+        return
+
+    val = parts[2]
+    if sub == "ram":
+        set_sys_config("ram", val)
+        send_msg(cid, f"✅ DuckDB RAM limit set to: <code>{_e(val)}</code>")
+    elif sub == "threads":
+        if not val.isdigit() or int(val) < 1:
+            send_msg(cid, "Threads positive integer hona chahiye.")
+            return
+        set_sys_config("threads", val)
+        send_msg(cid, f"✅ DuckDB CPU threads set to: <code>{_e(val)}</code>")
+    elif sub in ("concurrent", "sources"):
+        if not val.isdigit() or not (1 <= int(val) <= 7):
+            send_msg(cid, "Concurrent sources 1 se 7 ke beech hona chahiye.")
+            return
+        set_sys_config("concurrent", val)
+        send_msg(cid, f"✅ Max concurrent sources set to: <code>{_e(val)} / 7</code>")
+    elif sub in ("timeout", "time"):
+        if not val.isdigit() or int(val) < 3:
+            send_msg(cid, "Timeout kam se kam 3 seconds hona chahiye.")
+            return
+        set_sys_config("timeout", val)
+        send_msg(cid, f"✅ Search timeout set to: <code>{_e(val)}s</code>")
+    elif sub in ("queue", "maxqueue"):
+        if not val.isdigit() or int(val) < 1:
+            send_msg(cid, "Queue size positive integer hona chahiye.")
+            return
+        set_sys_config("queue", val)
+        send_msg(cid, f"✅ Search queue limit set to: <code>{_e(val)}</code>")
+    else:
+        send_msg(cid, "Unknown parameter. Options: profile, ram, threads, concurrent, timeout, queue, reset")
 
 def _admin_grant(cid: int, raw: str) -> None:
     parts = raw.split()
@@ -2827,8 +3044,20 @@ def _render_user(cid: int, target: int) -> tuple[str, list]:
     return _clip(text), kb
 
 def _render_settings(cid: int) -> tuple[str, list]:
-    lines = ["<b>⚙️ Settings</b>", "", f"Free daily limit · <b>{_free_limit()}</b>", ""]
-    lines.append("<b>Gateways</b>")
+    sys_cfg = get_all_sys_config()
+    lines = [
+        "<b>⚙️ Settings & System Tuning</b>", "",
+        f"Free daily limit · <b>{_free_limit()}</b>",
+        "",
+        "<b>System Architecture Tuning</b>",
+        f"• Profile · <b>{_e(sys_cfg['profile'].upper())}</b> ({_e(sys_cfg['profile_label'])})",
+        f"• RAM · <code>{_e(sys_cfg['ram'])}</code> · Threads · <code>{sys_cfg['threads']}</code>",
+        f"• Concurrent Sources · <code>{sys_cfg['concurrent']} / 7</code>",
+        f"• Query Timeout · <code>{sys_cfg['timeout']}s</code> · Queue · <code>{sys_cfg['queue']}</code>",
+        "Tune command · /sysconfig",
+        "",
+        "<b>Gateways</b>"
+    ]
     for gw, title in (("upi", "UPI"), ("stars", "Stars"), ("crypto", "Crypto")):
         busy = _busy_gateway(gw)
         lines.append(f"• {title} · <b>{'ON' if _gw_on(gw) else 'OFF'}</b> · flow mein {len(busy)}")
@@ -3233,13 +3462,16 @@ def worker() -> None:
 
             def _make_fetcher(src_def: dict):
                 def _fetch():
-                    try:
-                        all_sources[src_def["id"]] = src_def["search_fn"](query)
-                    except Exception as ex:
-                        log.warning("%s query error: %s", src_def["name"], ex)
-                        all_sources[src_def["id"]] = []
+                    sem = get_source_semaphore()
+                    with sem:
+                        try:
+                            all_sources[src_def["id"]] = src_def["search_fn"](query)
+                        except Exception as ex:
+                            log.warning("%s query error: %s", src_def["name"], ex)
+                            all_sources[src_def["id"]] = []
                 return _fetch
 
+            timeout_secs = float(get_sys_config_int("timeout", 15))
             t_db = time.monotonic()
             threads = [
                 threading.Thread(target=_make_fetcher(s), daemon=True)
@@ -3254,7 +3486,7 @@ def worker() -> None:
                 edit_msg(cid, mid, msg_stage(query, label))
 
             for th in threads:
-                th.join(timeout=15.0)
+                th.join(timeout=timeout_secs)
 
             elapsed = time.monotonic() - t_db
 
@@ -3385,7 +3617,8 @@ def _enqueue_search(cid: int, query: str) -> None:
         if blocked:
             send_msg(cid, msg_limit(user), kb=[[{"text": "👑 Premium Pass", "callback_data": "premium"}]])
             return
-    if _search_q.qsize() >= MAX_QUEUE:
+    dynamic_max_queue = get_sys_config_int("queue", MAX_QUEUE)
+    if _search_q.qsize() >= dynamic_max_queue:
         if counted:
             with _sl:
                 user = user_data.get(cid)
@@ -3909,6 +4142,9 @@ def _dispatch_cmd(cid: int, raw: str) -> None:
             _open_desk(cid, "home")
             return
         
+        if cmd in ("/sysconfig", "/tune"):
+            _cmd_sysconfig(cid, raw)
+            return
         if cmd == "/role":
             _cmd_role_audit(cid, raw)
             return
