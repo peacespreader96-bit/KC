@@ -577,6 +577,33 @@ def _seed_settings() -> None:
         if _kv_get(f"gw:{gw}", "") == "":
             _kv_set(f"gw:{gw}", "1")
 
+def _create_fresh_db() -> str | None:
+    """Wipes the existing DB (if any) and creates a brand new one."""
+    global _sql, MAINTENANCE
+    if _sql is not None:
+        try:
+            _sql.close()
+        except Exception:
+            pass
+    if os.path.isfile(_DB_PATH):
+        try:
+            os.remove(_DB_PATH)
+        except OSError as exc:
+            return f"Purani file delete nahi hui: {exc}. Host manually delete kar."
+            
+    try:
+        _sql = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        _sql.row_factory = sqlite3.Row
+        _init_sqlite()
+        _seed_settings()
+        MAINTENANCE = False
+        log.info("✅ Fresh SQLite DB created by admin request")
+        return None
+    except Exception as exc:
+        log.exception("Failed to create fresh DB")
+        MAINTENANCE = True
+        return f"Fresh DB banane mein error aaya: {exc}"
+
 def _bootstrap_sqlite() -> None:
     global _sql, MAINTENANCE
     auto_init = os.getenv("AUTO_INIT_DB", "1").lower() in ("1", "true", "yes")
@@ -612,32 +639,7 @@ def _bootstrap_sqlite() -> None:
 
 _bootstrap_sqlite()
 
-def _create_fresh_db() -> str | None:
-    """Wipes the existing DB (if any) and creates a brand new one."""
-    global _sql, MAINTENANCE
-    if _sql is not None:
-        try:
-            _sql.close()
-        except Exception:
-            pass
-    if os.path.isfile(_DB_PATH):
-        try:
-            os.remove(_DB_PATH)
-        except OSError as exc:
-            return f"Purani file delete nahi hui: {exc}. Host manually delete kar."
-            
-    try:
-        _sql = sqlite3.connect(_DB_PATH, check_same_thread=False)
-        _sql.row_factory = sqlite3.Row
-        _init_sqlite()
-        _seed_settings()
-        MAINTENANCE = False
-        log.info("✅ Fresh SQLite DB created by admin request")
-        return None
-    except Exception as exc:
-        log.exception("Failed to create fresh DB")
-        MAINTENANCE = True
-        return f"Fresh DB banane mein error aaya: {exc}"
+# _create_fresh_db moved above _bootstrap_sqlite
 
 def _expire_premium(u: dict) -> bool:
     until = float(u.get("premium_until") or 0)
