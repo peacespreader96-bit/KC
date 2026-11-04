@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-KaramChand OSINT Telegram Bot · Enterprise Edition
+KaramChand OSINT Telegram Bot · Enterprise Multi-Source Edition
 FastAPI + DuckDB (httpfs/HuggingFace) + Long Polling + SQLite members
-Optimized for ultra-fast multi-source lookups, streamlined Telegram inline UI,
-and anonymized intelligence data sources (KC-SOURCE-01, KC-SOURCE-02).
+Optimized for ultra-fast multi-source lookups across 7 distinct repositories:
+  • KC-SOURCE-01 : Core Telecom & Citizen File (Hitek mixed)
+  • KC-SOURCE-02 : Telecom Archive (Umba bucket)
+  • KC-SOURCE-03 : BSNL Mobile Directory (18.1M records)
+  • KC-SOURCE-04 : Indian Cars & Asset Registry (966k records)
+  • KC-SOURCE-05 : Cellular Air Repository (73.1M records)
+  • KC-SOURCE-06 : E-Commerce Customer Directory (3.8M records)
+  • KC-SOURCE-07 : Telegram Master Registry (429.6M records)
+Reconstructed dynamic UI: only non-empty sources are displayed.
 """
 
 import csv
@@ -41,9 +48,16 @@ BOT_NAME    = os.getenv("BOT_NAME",   "KaramChand")
 UPI_ID      = os.getenv("UPI_ID",     "admin@upi")
 USDT_BEP20  = os.getenv("USDT_BEP20", "0x0000000000000000000000000000000000000000")
 USDT_TRC20  = os.getenv("USDT_TRC20", "TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXx")
-BASE_HF     = "hf://buckets/CutehackX/icrm-hitek-full-db-mixed-bucket/"
-BASE_HF_UMBA = os.getenv("BASE_HF_UMBA", "hf://buckets/Khanenterprises/umba-bucket/")
-BASE_URL    = f"https://api.telegram.org/bot{TOKEN}"
+BASE_HF          = os.getenv("BASE_HF",          "hf://buckets/CutehackX/icrm-hitek-full-db-mixed-bucket/")
+BASE_HF_UMBA     = os.getenv("BASE_HF_UMBA",     "hf://buckets/Khanenterprises/umba-bucket/")
+BASE_HF_BSNL     = os.getenv("BASE_HF_BSNL",     "hf://buckets/Khanenterprises/Bsnalumba/19M-BSNL_Mobile.parquet")
+BASE_HF_CAR      = os.getenv("BASE_HF_CAR",      "hf://buckets/Khanenterprises/Carumba/Indian Cars Owner Details.parquet")
+BASE_HF_AIR      = os.getenv("BASE_HF_AIR",      "hf://buckets/Khanenterprises/Umbaairbucket/data.parquet")
+BASE_HF_FLIP     = os.getenv("BASE_HF_FLIP",     "hf://buckets/Khanenterprises/Umbaflip-bucket/flipkart.parquet")
+BASE_HF_TG       = os.getenv("BASE_HF_TG",       "hf://buckets/Khanenterprises/Umbat-bucket/TELEGRAM_MASTER_DB.parquet")
+DUCKDB_MEM_LIMIT = os.getenv("DUCKDB_MEM_LIMIT", "500MB")
+DUCKDB_THREADS   = int(os.getenv("DUCKDB_THREADS", "4"))
+BASE_URL         = f"https://api.telegram.org/bot{TOKEN}"
 
 FORCE_CHANNELS: list[str] = []
 _fc_env = os.getenv("FORCE_CHANNELS", "").strip()
@@ -127,32 +141,129 @@ log = logging.getLogger("bot")
 app = FastAPI(title="KaramChand", docs_url=None, redoc_url=None)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DUCKDB
+#  DUCKDB · MULTI-SOURCE INTEGRATION (7 ENTERPRISE SOURCES)
 # ═══════════════════════════════════════════════════════════════════════════════
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 log.info("⏳ Initialising DuckDB connection …")
 db = duckdb.connect(config={"custom_user_agent": _UA})
-db.execute("SET memory_limit='350MB'; SET threads=2; SET http_timeout=15000; SET enable_progress_bar=false;")
+db.execute(f"SET memory_limit='{DUCKDB_MEM_LIMIT}'; SET threads={DUCKDB_THREADS}; SET http_timeout=15000; SET enable_progress_bar=false;")
 db.execute("INSTALL httpfs; LOAD httpfs;")
 if HF_TOKEN and HF_TOKEN != "hf_YOUR_READ_TOKEN_HERE":
-    db.execute(f"CREATE SECRET (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
+    try:
+        db.execute(f"CREATE SECRET (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
+    except Exception as _sec_ex:
+        log.warning("DuckDB CREATE SECRET notice: %s", _sec_ex)
 
-try:
-    db.execute(f"CREATE VIEW people_phone AS SELECT * FROM read_parquet('{BASE_HF}idx_phone.*.parquet')")
-    db.execute(f"""
-        CREATE VIEW people_umba AS
-        SELECT Number   AS phoneNumber,
-               Name     AS name,
-               Address  AS address,
-               Email    AS email,
-               Gender   AS gender,
-               Carrier  AS carrier
-        FROM   read_parquet('{BASE_HF_UMBA}idx_phone.*.parquet')
-    """)
-    log.info("✅ DuckDB ready with multi-source views (Glob)")
-except Exception as e:
-    log.error("DuckDB view init failed: %s", e)
+# Individual view creation to prevent one slow/unreachable bucket from blocking others
+_VIEW_DEFS = [
+    (
+        "people_phone",
+        f"CREATE VIEW IF NOT EXISTS people_phone AS SELECT * FROM read_parquet('{BASE_HF}idx_phone.*.parquet')"
+    ),
+    (
+        "people_umba",
+        f"""CREATE VIEW IF NOT EXISTS people_umba AS
+            SELECT "Number"   AS phoneNumber,
+                   "Name"     AS name,
+                   "Address"  AS address,
+                   "Email"    AS email,
+                   "Gender"   AS gender,
+                   "Carrier"  AS carrier
+            FROM   read_parquet('{BASE_HF_UMBA}idx_phone.*.parquet')"""
+    ),
+    (
+        "people_bsnl",
+        f"""CREATE VIEW IF NOT EXISTS people_bsnl AS
+            SELECT "Number"      AS number,
+                   "Carrier"     AS carrier,
+                   "Name"        AS name,
+                   "Gender"      AS gender,
+                   "Address"     AS address,
+                   "JobTitle"    AS job_title,
+                   "CompanyName" AS company_name,
+                   "Email"       AS email,
+                   "Facebook"    AS facebook,
+                   "Twitter"     AS twitter
+            FROM   read_parquet('{BASE_HF_BSNL}')"""
+    ),
+    (
+        "people_cars",
+        f"""CREATE VIEW IF NOT EXISTS people_cars AS
+            SELECT "Name"          AS name,
+                   "Mobile No"     AS mobile_no,
+                   "Address"       AS address,
+                   "Pin Code"      AS pincode,
+                   "City"          AS city,
+                   "Submodel"      AS submodel,
+                   "Model"         AS model,
+                   "Assettype"     AS asset_type,
+                   "Misstatus"     AS mis_status,
+                   "Tenor"         AS tenor,
+                   "Roi"           AS roi,
+                   "Irr"           AS irr,
+                   "Noadvemi"      AS no_adv_emi,
+                   "Emiamt"        AS emi_amt,
+                   "Netltv"        AS net_ltv,
+                   "Mfrsubded"     AS mfr_sub_ded,
+                   "Mfrsubnded"    AS mfr_sub_nded,
+                   "Dlrsubded"     AS dlr_sub_ded,
+                   "Dlrsubnded"    AS dlr_sub_nded,
+                   "Dsasubded"     AS dsa_sub_ded,
+                   "Promotiondesc" AS promotion_desc,
+                   "Product"       AS product
+            FROM   read_parquet('{BASE_HF_CAR}')"""
+    ),
+    (
+        "people_air",
+        f"""CREATE VIEW IF NOT EXISTS people_air AS
+            SELECT "Number"      AS number,
+                   "Carrier"     AS carrier,
+                   "Name"        AS name,
+                   "Gender"      AS gender,
+                   "Address"     AS address,
+                   "JobTitle"    AS job_title,
+                   "CompanyName" AS company_name,
+                   "Email"       AS email,
+                   "Facebook"    AS facebook,
+                   "Twitter"     AS twitter
+            FROM   read_parquet('{BASE_HF_AIR}')"""
+    ),
+    (
+        "people_flipkart",
+        f"""CREATE VIEW IF NOT EXISTS people_flipkart AS
+            SELECT "CustomerName"    AS name,
+                   "CustomerPhone"   AS phone,
+                   "CustomerEmail"   AS email,
+                   "CustomerAddress" AS address,
+                   "CustomerCity"    AS city,
+                   "CustomerState"   AS state,
+                   "CustomerPincode" AS pincode
+            FROM   read_parquet('{BASE_HF_FLIP}')"""
+    ),
+    (
+        "people_telegram",
+        f"""CREATE VIEW IF NOT EXISTS people_telegram AS
+            SELECT "user_id"       AS user_id,
+                   "username"      AS username,
+                   "first_name"    AS first_name,
+                   "last_name"     AS last_name,
+                   "phone"         AS phone,
+                   "email"         AS email,
+                   "status"        AS status,
+                   "linked_id"     AS linked_id,
+                   "linked_name"   AS linked_name,
+                   "linked_handle" AS linked_handle
+            FROM   read_parquet('{BASE_HF_TG}')"""
+    ),
+]
+
+for vname, ddl in _VIEW_DEFS:
+    try:
+        db.execute(ddl)
+        log.info("✅ DuckDB view ready: %s", vname)
+    except Exception as _ex:
+        log.warning("DuckDB view init notice (%s): %s", vname, _ex)
 
 _db_lock = threading.RLock()
 
@@ -160,27 +271,98 @@ def _to_dicts(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     cols = [d[0] for d in conn.description]
     return [{c: (None if str(v) == "nan" else v) for c, v in zip(cols, row)} for row in conn.fetchall()]
 
-def db_search(number: str) -> list[dict]:
-    sql = "SELECT * FROM people_phone WHERE phoneNumber = ? LIMIT 5"
+def _phone_variants(raw_number: str) -> list[str]:
+    """Generates standard Indian phone formatting variants for exact Parquet pushdown matching."""
+    s = str(raw_number).strip()
+    digits = re.sub(r"\D", "", s)
+    if len(digits) == 12 and digits.startswith("91"):
+        d10 = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        d10 = digits[1:]
+    elif len(digits) >= 10:
+        d10 = digits[-10:]
+    else:
+        d10 = digits
+
+    variants = [
+        d10,
+        f"91{d10}",
+        f"+91{d10}",
+        f"0{d10}",
+        f"+91 {d10}",
+        f"{d10[:5]} {d10[5:]}",
+        f"+91 {d10[:5]} {d10[5:]}",
+    ]
+    seen = set()
+    ordered = []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            ordered.append(v)
+    return ordered
+
+def _safe_query(sql: str, params: list, source_name: str = "") -> list[dict]:
+    """Thread-safe query execution with cursor pooling and fallback lock."""
     try:
         cur = db.cursor()
-        res = _to_dicts(cur.execute(sql, [number]))
+        res = _to_dicts(cur.execute(sql, params))
         cur.close()
         return res
     except Exception:
         with _db_lock:
-            return _to_dicts(db.execute(sql, [number]))
+            try:
+                cur2 = db.cursor()
+                res = _to_dicts(cur2.execute(sql, params))
+                cur2.close()
+                return res
+            except Exception as ex2:
+                log.warning("DuckDB query failed [%s]: %s", source_name or "DB", ex2)
+                return []
+
+def db_search_main(number: str) -> list[dict]:
+    vars_list = _phone_variants(number)
+    ph = ", ".join(["?"] * len(vars_list))
+    sql = f"SELECT * FROM people_phone WHERE phoneNumber IN ({ph}) LIMIT 5"
+    return _safe_query(sql, vars_list, "KC-SOURCE-01")
 
 def db_search_umba(number: str) -> list[dict]:
-    sql = "SELECT * FROM people_umba WHERE phoneNumber = ? LIMIT 5"
-    try:
-        cur = db.cursor()
-        res = _to_dicts(cur.execute(sql, [number]))
-        cur.close()
-        return res
-    except Exception:
-        with _db_lock:
-            return _to_dicts(db.execute(sql, [number]))
+    vars_list = _phone_variants(number)
+    ph = ", ".join(["?"] * len(vars_list))
+    sql = f"SELECT * FROM people_umba WHERE phoneNumber IN ({ph}) LIMIT 5"
+    return _safe_query(sql, vars_list, "KC-SOURCE-02")
+
+def db_search_bsnl(number: str) -> list[dict]:
+    vars_list = _phone_variants(number)
+    ph = ", ".join(["?"] * len(vars_list))
+    sql = f"SELECT * FROM people_bsnl WHERE number IN ({ph}) LIMIT 5"
+    return _safe_query(sql, vars_list, "KC-SOURCE-03")
+
+def db_search_cars(number: str) -> list[dict]:
+    vars_list = _phone_variants(number)
+    ph = ", ".join(["?"] * len(vars_list))
+    sql = f"SELECT * FROM people_cars WHERE mobile_no IN ({ph}) LIMIT 5"
+    return _safe_query(sql, vars_list, "KC-SOURCE-04")
+
+def db_search_air(number: str) -> list[dict]:
+    vars_list = _phone_variants(number)
+    ph = ", ".join(["?"] * len(vars_list))
+    sql = f"SELECT * FROM people_air WHERE number IN ({ph}) LIMIT 5"
+    return _safe_query(sql, vars_list, "KC-SOURCE-05")
+
+def db_search_flipkart(number: str) -> list[dict]:
+    vars_list = _phone_variants(number)
+    ph = ", ".join(["?"] * len(vars_list))
+    sql = f"SELECT * FROM people_flipkart WHERE phone IN ({ph}) LIMIT 5"
+    return _safe_query(sql, vars_list, "KC-SOURCE-06")
+
+def db_search_telegram(number: str) -> list[dict]:
+    vars_list = _phone_variants(number)
+    ph = ", ".join(["?"] * len(vars_list))
+    sql = f"SELECT * FROM people_telegram WHERE phone IN ({ph}) LIMIT 5"
+    return _safe_query(sql, vars_list, "KC-SOURCE-07")
+
+# Compatibility alias
+db_search = db_search_main
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SHARED STATE
@@ -1178,7 +1360,11 @@ def msg_welcome(name: str) -> str:
 def _spoiler(value: str) -> str:
     return f"<tg-spoiler><code>{_e(value)}</code></tg-spoiler>"
 
-def format_card(row: dict, query: str, elapsed: float | None = None) -> str:
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INDIVIDUAL SOURCE UI BLOCK FORMATTERS (Only Non-Empty Sources Displayed)
+# ═══════════════════════════════════════════════════════════════════════════════
+def _format_main_block(row: dict) -> list[str]:
+    lines = ["📁 <b>KC-SOURCE-01 · CORE CITIZEN DIRECTORY</b>"]
     name         = sv(row.get("name"))
     fathersName  = sv(row.get("fathersName"))
     phoneNumber  = sv(row.get("phoneNumber"))
@@ -1189,14 +1375,6 @@ def format_card(row: dict, query: str, elapsed: float | None = None) -> str:
     pincode      = sv(row.get("pincode"))
     district     = sv(row.get("district"))
     town         = sv(row.get("town"))
-
-    lines = [
-        "<b>⚡ KC CUSTOMER FILE</b>",
-        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-        f"🔎 <b>Target:</b> <code>{_e(query)}</code>",
-        "",
-        "📁 <b>KC-SOURCE-01</b>",
-    ]
     if name:         lines.append(f"  👤 <b>Naam:</b> {_e(name)}")
     if fathersName:  lines.append(f"  👨 <b>Father:</b> {_e(fathersName)}")
     if phoneNumber:  lines.append(f"  📱 <b>Number:</b> {_spoiler(phoneNumber)}")
@@ -1206,86 +1384,214 @@ def format_card(row: dict, query: str, elapsed: float | None = None) -> str:
     loc = ", ".join(x for x in [town, district, state] if x)
     if loc:          lines.append(f"  📍 <b>Location:</b> {_e(loc)}")
     if pincode:      lines.append(f"  📮 <b>Zip:</b> <code>{_e(pincode)}</code>")
-    lines += ["", f"🕰 {ts_str()}"]
+    return lines
+
+def _format_umba_block(row: dict) -> list[str]:
+    lines = ["📂 <b>KC-SOURCE-02 · TELECOM ARCHIVE</b>"]
+    u_phone   = sv(row.get("phoneNumber"))
+    u_name    = sv(row.get("name"))
+    u_address = clean_addr(row.get("address"))
+    u_email   = sv(row.get("email"))
+    u_gender  = sv(row.get("gender"))
+    u_carrier = sv(row.get("carrier"))
+    if u_name:    lines.append(f"  👤 <b>Naam:</b> {_e(u_name)}")
+    if u_phone:   lines.append(f"  📱 <b>Number:</b> {_spoiler(u_phone)}")
+    if u_address: lines.append(f"  🏠 <b>Address:</b>\n<blockquote expandable>{_e(u_address)}</blockquote>")
+    if u_email:   lines.append(f"  📧 <b>Email:</b> {_spoiler(u_email)}")
+    if u_gender:  lines.append(f"  🧬 <b>Gender:</b> {_e(u_gender)}")
+    if u_carrier: lines.append(f"  📡 <b>Carrier:</b> {_e(u_carrier)}")
+    return lines
+
+def _format_bsnl_block(row: dict) -> list[str]:
+    lines = ["📡 <b>KC-SOURCE-03 · BSNL MOBILE</b>"]
+    name         = sv(row.get("name"))
+    number       = sv(row.get("number"))
+    carrier      = sv(row.get("carrier"))
+    gender       = sv(row.get("gender"))
+    address      = clean_addr(row.get("address"))
+    job_title    = sv(row.get("job_title"))
+    company_name = sv(row.get("company_name"))
+    email        = sv(row.get("email"))
+    facebook     = sv(row.get("facebook"))
+    twitter      = sv(row.get("twitter"))
+    if name:         lines.append(f"  👤 <b>Naam:</b> {_e(name)}")
+    if number:       lines.append(f"  📱 <b>Number:</b> {_spoiler(number)}")
+    if carrier:      lines.append(f"  📡 <b>Carrier:</b> {_e(carrier)}")
+    if gender:       lines.append(f"  🧬 <b>Gender:</b> {_e(gender)}")
+    if address:      lines.append(f"  🏠 <b>Address:</b>\n<blockquote expandable>{_e(address)}</blockquote>")
+    if job_title or company_name:
+        work = " at ".join(x for x in [job_title, company_name] if x)
+        lines.append(f"  💼 <b>Work:</b> {_e(work)}")
+    if email:        lines.append(f"  📧 <b>Email:</b> {_spoiler(email)}")
+    if facebook:     lines.append(f"  🌐 <b>Facebook:</b> <code>{_e(facebook)}</code>")
+    if twitter:      lines.append(f"  🐦 <b>Twitter:</b> <code>{_e(twitter)}</code>")
+    return lines
+
+def _format_cars_block(row: dict) -> list[str]:
+    lines = ["🚗 <b>KC-SOURCE-04 · VEHICLE REGISTRY</b>"]
+    name        = sv(row.get("name"))
+    mobile_no   = sv(row.get("mobile_no"))
+    address     = clean_addr(row.get("address"))
+    city        = sv(row.get("city"))
+    pincode     = sv(row.get("pincode"))
+    model       = sv(row.get("model"))
+    submodel    = sv(row.get("submodel"))
+    asset_type  = sv(row.get("asset_type"))
+    product     = sv(row.get("product"))
+    emi_amt     = sv(row.get("emi_amt"))
+    tenor       = sv(row.get("tenor"))
+    roi         = sv(row.get("roi"))
+    irr         = sv(row.get("irr"))
+    mis_status  = sv(row.get("mis_status"))
+    if name:        lines.append(f"  👤 <b>Naam:</b> {_e(name)}")
+    if mobile_no:   lines.append(f"  📱 <b>Mobile:</b> {_spoiler(mobile_no)}")
+    if model or submodel:
+        car = " · ".join(x for x in [model, submodel] if x)
+        lines.append(f"  🚘 <b>Car:</b> {_e(car)}")
+    if asset_type or product:
+        prod = " · ".join(x for x in [asset_type, product] if x)
+        lines.append(f"  🏷 <b>Asset:</b> {_e(prod)}")
+    if address:     lines.append(f"  🏠 <b>Address:</b>\n<blockquote expandable>{_e(address)}</blockquote>")
+    loc = ", ".join(x for x in [city, pincode] if x)
+    if loc:         lines.append(f"  📍 <b>City/Pin:</b> {_e(loc)}")
+    if emi_amt:     lines.append(f"  💰 <b>EMI:</b> ₹{_e(emi_amt)}")
+    if tenor:       lines.append(f"  ⏳ <b>Tenor:</b> {_e(tenor)}m")
+    if roi or irr:
+        rates = " / ".join(f"ROI: {r}" for r in [roi, irr] if r)
+        lines.append(f"  📈 <b>Rate:</b> {_e(rates)}")
+    if mis_status:  lines.append(f"  📊 <b>Status:</b> {_e(mis_status)}")
+    return lines
+
+def _format_air_block(row: dict) -> list[str]:
+    lines = ["📶 <b>KC-SOURCE-05 · AIR REPO</b>"]
+    name         = sv(row.get("name"))
+    number       = sv(row.get("number"))
+    carrier      = sv(row.get("carrier"))
+    gender       = sv(row.get("gender"))
+    address      = clean_addr(row.get("address"))
+    job_title    = sv(row.get("job_title"))
+    company_name = sv(row.get("company_name"))
+    email        = sv(row.get("email"))
+    facebook     = sv(row.get("facebook"))
+    twitter      = sv(row.get("twitter"))
+    if name:         lines.append(f"  👤 <b>Naam:</b> {_e(name)}")
+    if number:       lines.append(f"  📱 <b>Number:</b> {_spoiler(number)}")
+    if carrier:      lines.append(f"  📡 <b>Carrier:</b> {_e(carrier)}")
+    if gender:       lines.append(f"  🧬 <b>Gender:</b> {_e(gender)}")
+    if address:      lines.append(f"  🏠 <b>Address:</b>\n<blockquote expandable>{_e(address)}</blockquote>")
+    if job_title or company_name:
+        work = " at ".join(x for x in [job_title, company_name] if x)
+        lines.append(f"  💼 <b>Work:</b> {_e(work)}")
+    if email:        lines.append(f"  📧 <b>Email:</b> {_spoiler(email)}")
+    if facebook:     lines.append(f"  🌐 <b>Facebook:</b> <code>{_e(facebook)}</code>")
+    if twitter:      lines.append(f"  🐦 <b>Twitter:</b> <code>{_e(twitter)}</code>")
+    return lines
+
+def _format_flipkart_block(row: dict) -> list[str]:
+    lines = ["🛍️ <b>KC-SOURCE-06 · FLIPKART COMMERCE</b>"]
+    name    = sv(row.get("name"))
+    phone   = sv(row.get("phone"))
+    email   = sv(row.get("email"))
+    address = clean_addr(row.get("address"))
+    city    = sv(row.get("city"))
+    state   = sv(row.get("state"))
+    pincode = sv(row.get("pincode"))
+    if name:    lines.append(f"  👤 <b>Customer:</b> {_e(name)}")
+    if phone:   lines.append(f"  📱 <b>Phone:</b> {_spoiler(phone)}")
+    if email:   lines.append(f"  📧 <b>Email:</b> {_spoiler(email)}")
+    if address: lines.append(f"  🏠 <b>Address:</b>\n<blockquote expandable>{_e(address)}</blockquote>")
+    loc = ", ".join(x for x in [city, state, pincode] if x)
+    if loc:     lines.append(f"  📍 <b>Location:</b> {_e(loc)}")
+    return lines
+
+def _format_telegram_block(row: dict) -> list[str]:
+    lines = ["✈️ <b>KC-SOURCE-07 · TELEGRAM MASTER</b>"]
+    first_name    = sv(row.get("first_name"))
+    last_name     = sv(row.get("last_name"))
+    full_name     = " ".join(x for x in [first_name, last_name] if x)
+    username      = sv(row.get("username"))
+    user_id       = sv(row.get("user_id"))
+    phone         = sv(row.get("phone"))
+    email         = sv(row.get("email"))
+    status        = sv(row.get("status"))
+    linked_id     = sv(row.get("linked_id"))
+    linked_name   = sv(row.get("linked_name"))
+    linked_handle = sv(row.get("linked_handle"))
+    if full_name:     lines.append(f"  👤 <b>Name:</b> {_e(full_name)}")
+    if username:      lines.append(f"  🌐 <b>Username:</b> @{_e(username)}")
+    if user_id:       lines.append(f"  🆔 <b>TG ID:</b> <code>{_e(user_id)}</code>")
+    if phone:         lines.append(f"  📱 <b>Phone:</b> {_spoiler(phone)}")
+    if email:         lines.append(f"  📧 <b>Email:</b> {_spoiler(email)}")
+    if status:        lines.append(f"  🔰 <b>Status:</b> {_e(status)}")
+    if linked_name or linked_handle or linked_id:
+        acc = " · ".join(x for x in [linked_name, linked_handle, linked_id] if x)
+        lines.append(f"  🔗 <b>Linked:</b> {_e(acc)}")
+    return lines
+
+# Registry of all supported intelligence sources
+SOURCES = [
+    {"id": "main",     "name": "KC-SOURCE-01", "search_fn": db_search_main,     "format_fn": _format_main_block},
+    {"id": "umba",     "name": "KC-SOURCE-02", "search_fn": db_search_umba,     "format_fn": _format_umba_block},
+    {"id": "bsnl",     "name": "KC-SOURCE-03", "search_fn": db_search_bsnl,     "format_fn": _format_bsnl_block},
+    {"id": "cars",     "name": "KC-SOURCE-04", "search_fn": db_search_cars,     "format_fn": _format_cars_block},
+    {"id": "air",      "name": "KC-SOURCE-05", "search_fn": db_search_air,      "format_fn": _format_air_block},
+    {"id": "flipkart", "name": "KC-SOURCE-06", "search_fn": db_search_flipkart, "format_fn": _format_flipkart_block},
+    {"id": "telegram", "name": "KC-SOURCE-07", "search_fn": db_search_telegram, "format_fn": _format_telegram_block},
+]
+
+def format_card_sources(
+    sources_data: dict[str, dict | None],
+    query: str,
+    elapsed: float | None = None,
+) -> str:
+    """Renders telegram message containing ONLY sources that returned records."""
+    blocks = []
+    for src in SOURCES:
+        row = sources_data.get(src["id"])
+        if row:
+            b_lines = src["format_fn"](row)
+            if b_lines:
+                blocks.append("\n".join(b_lines))
+
+    if not blocks:
+        return msg_no_result(query)
+
+    header = [
+        "<b>⚡ KC CUSTOMER FILE</b>",
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+        f"🔎 <b>Target:</b> <code>{_e(query)}</code>",
+        "",
+    ]
+    body = "\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n\n".join(blocks)
+    footer = ["", f"🕰 {ts_str()}"]
     if elapsed is not None:
-        lines.append(f"⚡ Speed: {elapsed_label(elapsed)}")
-        if elapsed < 1.0: lines.append("🏎️ <b>BHAI YE TOH ROCKET THA</b>")
-    lines.append(_D)
-    return "\n".join(lines)
+        footer.append(f"⚡ Speed: {elapsed_label(elapsed)}")
+        if elapsed < 1.0:
+            footer.append("🏎️ <b>BHAI YE TOH ROCKET THA</b>")
+    footer.append(_D)
+
+    full_text = "\n".join(header) + body + "\n" + "\n".join(footer)
+    return _clip(full_text, 4000)
+
+def format_card(row: dict, query: str, elapsed: float | None = None) -> str:
+    return format_card_sources({"main": row}, query, elapsed)
 
 def format_card_combined(
     row_main: dict | None, row_umba: dict | None,
     query: str, elapsed: float | None = None
 ) -> str:
-    lines = [
-        "<b>⚡ KC CUSTOMER FILE</b>",
-        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-        f"🔎 <b>Target:</b> <code>{_e(query)}</code>",
-        "",
-        "📁 <b>KC-SOURCE-01</b>",
-    ]
-
-    if row_main:
-        name         = sv(row_main.get("name"))
-        fathersName  = sv(row_main.get("fathersName"))
-        phoneNumber  = sv(row_main.get("phoneNumber"))
-        otherNumber  = sv(row_main.get("otherNumber"))
-        aadharNumber = sv(row_main.get("aadharNumber"))
-        address      = clean_addr(row_main.get("address"))
-        state        = sv(row_main.get("state"))
-        pincode      = sv(row_main.get("pincode"))
-        district     = sv(row_main.get("district"))
-        town         = sv(row_main.get("town"))
-        if name:         lines.append(f"  👤 <b>Naam:</b> {_e(name)}")
-        if fathersName:  lines.append(f"  👨 <b>Father:</b> {_e(fathersName)}")
-        if phoneNumber:  lines.append(f"  📱 <b>Number:</b> {_spoiler(phoneNumber)}")
-        if otherNumber:  lines.append(f"  📞 <b>Dusra:</b> {_spoiler(otherNumber)}")
-        if aadharNumber: lines.append(f"  🪪 <b>ID:</b> {_spoiler(aadharNumber)}")
-        if address:      lines.append(f"  🏠 <b>Address:</b>\n<blockquote expandable>{_e(address)}</blockquote>")
-        loc = ", ".join(x for x in [town, district, state] if x)
-        if loc:          lines.append(f"  📍 <b>Location:</b> {_e(loc)}")
-        if pincode:      lines.append(f"  📮 <b>Zip:</b> <code>{_e(pincode)}</code>")
-    else:
-        lines.append("  <i>Koi record nahi mila</i>")
-
-    lines.append("")
-    lines.append("┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
-    lines.append("")
-
-    lines.append("📂 <b>KC-SOURCE-02</b>")
-    if row_umba:
-        u_phone   = sv(row_umba.get("phoneNumber"))
-        u_name    = sv(row_umba.get("name"))
-        u_address = clean_addr(row_umba.get("address"))
-        u_email   = sv(row_umba.get("email"))
-        u_gender  = sv(row_umba.get("gender"))
-        u_carrier = sv(row_umba.get("carrier"))
-        if u_name:    lines.append(f"  👤 <b>Naam:</b> {_e(u_name)}")
-        if u_phone:   lines.append(f"  📱 <b>Number:</b> {_spoiler(u_phone)}")
-        if u_address: lines.append(f"  🏠 <b>Address:</b>\n<blockquote expandable>{_e(u_address)}</blockquote>")
-        if u_email:   lines.append(f"  📧 <b>Email:</b> {_spoiler(u_email)}")
-        if u_gender:  lines.append(f"  🧬 <b>Gender:</b> {_e(u_gender)}")
-        if u_carrier: lines.append(f"  📡 <b>Carrier:</b> {_e(u_carrier)}")
-    else:
-        lines.append("  <i>Koi record nahi mila</i>")
-
-    lines += ["", f"🕰 {ts_str()}"]
-    if elapsed is not None:
-        lines.append(f"⚡ Speed: {elapsed_label(elapsed)}")
-        if elapsed < 1.0:
-            lines.append("🏎️ <b>BHAI YE TOH ROCKET THA</b>")
-    lines.append(_D)
-    return "\n".join(lines)
+    return format_card_sources({"main": row_main, "umba": row_umba}, query, elapsed)
 
 _HTML_CSS = """
 :root { --ink:#16130f; --paper:#f7f1e6; --gold:#8a6d3b; --line:#e0d3bf; --mute:#6e6458; }
 * { box-sizing: border-box; }
 body { margin:0; background:#e7dcc6; color:var(--ink); font: 16px/1.55 Georgia, serif; }
-article { max-width: 680px; margin: 36px auto; background: var(--paper); padding: 48px 44px 40px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); border-radius: 6px; }
+article { max-width: 720px; margin: 36px auto; background: var(--paper); padding: 48px 44px 40px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); border-radius: 6px; }
 .kicker { margin:0; font: 600 11px/1.4 sans-serif; letter-spacing: .22em; text-transform: uppercase; color: var(--gold); }
 h1 { font-weight: 500; font-size: 32px; line-height: 1.15; margin: 10px 0 0; }
 .rule { height: 1px; border: 0; margin: 22px 0; background: linear-gradient(90deg, #c6a15b, transparent); }
-.rows { display: grid; grid-template-columns: 168px 1fr; gap: 12px 18px; word-wrap: break-word; max-width: 100%; overflow-wrap: break-word; }
+.sec-title { font: 700 13px/1.4 sans-serif; letter-spacing: .12em; text-transform: uppercase; color: var(--gold); margin: 20px 0 8px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+.rows { display: grid; grid-template-columns: 168px 1fr; gap: 10px 18px; word-wrap: break-word; max-width: 100%; overflow-wrap: break-word; margin-bottom: 16px; }
 .k { font: 600 11px/1.4 sans-serif; letter-spacing: .08em; text-transform: uppercase; color: var(--mute); padding-top: 4px; }
 .v { margin:0; word-wrap: break-word; max-width: 100%; overflow-wrap: break-word; }
 .memo { margin-top: 28px; padding: 16px 0 0; border-top: 1px solid var(--line); }
@@ -1295,58 +1601,47 @@ footer { margin-top: 28px; font: 12px/1.4 sans-serif; color: var(--mute); }
 """
 
 def _html_page(title: str, kicker: str, pairs: list[tuple[str, str]], memo: str) -> str:
-    cells = [f"<div class='k'>{_e(l)}</div><p class='v'>{v}</p>" for l, v in pairs if v]
+    cells = []
+    for l, v in pairs:
+        if l.startswith("SECTION:"):
+            sec_name = l.split(":", 1)[1]
+            cells.append(f"<div style='grid-column: 1 / -1;' class='sec-title'>{_e(sec_name)}</div>")
+        elif v:
+            cells.append(f"<div class='k'>{_e(l)}</div><p class='v'>{v}</p>")
+
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>{_e(title)}</title><style>{_HTML_CSS}</style></head>
 <body><article><p class="kicker">{_e(kicker)}</p><h1>{_e(title)}</h1><hr class="rule"/>
 <section class="rows">{''.join(cells)}</section>
 <section class="memo"><b>Memo</b><p>{memo}</p></section>
-<footer>{_e(BOT_NAME)} · Private intelligence report · {_e(ts_str())}</footer></article></body></html>"""
+<footer>{_e(BOT_NAME)} · Private intelligence dossier · {_e(ts_str())}</footer></article></body></html>"""
 
-def generate_html(row: dict, query: str) -> str:
-    address = clean_addr(row.get("address"))
-    loc = ", ".join(x for x in [sv(row.get("town")), sv(row.get("district")), sv(row.get("state"))] if x)
-    pairs = [
-        ("Query", f"<code>{_e(query)}</code>"),
-        ("Source", "<b>KC-SOURCE-01</b>"),
-        ("Naam", _e(sv(row.get("name")))),
-        ("Father", _e(sv(row.get("fathersName")))),
-        ("Number", _e(sv(row.get("phoneNumber")))),
-        ("Dusra number", _e(sv(row.get("otherNumber")))),
-        ("ID", _e(sv(row.get("aadharNumber")))),
-        ("Address", _e(address)),
-        ("Location", _e(loc)),
-        ("Zip", _e(sv(row.get("pincode")))),
-    ]
-    memo = f"{_e(BOT_NAME)} private directory file."
-    title = sv(row.get("name")) or f"Report for {query}"
-    return _html_page(title, f"{BOT_NAME} · Intelligence File", pairs, memo)
-
-def generate_html_combined(row_main: dict | None, row_umba: dict | None, query: str) -> str:
+def generate_html_all(sources_data: dict[str, dict | None], query: str) -> str:
     pairs: list[tuple[str, str]] = [("Target", f"<code>{_e(query)}</code>")]
 
-    pairs.append(("📁 Source", "<b>KC-SOURCE-01</b>"))
+    # KC-SOURCE-01
+    row_main = sources_data.get("main")
     if row_main:
-        address = clean_addr(row_main.get("address"))
+        pairs.append(("SECTION:KC-SOURCE-01 · CORE DIRECTORY", ""))
+        addr = clean_addr(row_main.get("address"))
         loc = ", ".join(x for x in [sv(row_main.get("town")), sv(row_main.get("district")), sv(row_main.get("state"))] if x)
-        for label, val in [
+        for l, v in [
             ("Naam",       _e(sv(row_main.get("name")))),
             ("Father",     _e(sv(row_main.get("fathersName")))),
             ("Number",     _e(sv(row_main.get("phoneNumber")))),
             ("Alt Number", _e(sv(row_main.get("otherNumber")))),
             ("ID",         _e(sv(row_main.get("aadharNumber")))),
-            ("Address",    _e(address)),
+            ("Address",    _e(addr)),
             ("Location",   _e(loc)),
             ("Zip",        _e(sv(row_main.get("pincode")))),
         ]:
-            if val:
-                pairs.append((label, val))
-    else:
-        pairs.append(("KC-SOURCE-01 Status", "<i>No record found</i>"))
+            if v: pairs.append((l, v))
 
-    pairs.append(("📂 Source", "<b>KC-SOURCE-02</b>"))
+    # KC-SOURCE-02
+    row_umba = sources_data.get("umba")
     if row_umba:
+        pairs.append(("SECTION:KC-SOURCE-02 · TELECOM ARCHIVE", ""))
         u_addr = clean_addr(row_umba.get("address"))
-        for label, val in [
+        for l, v in [
             ("Naam",    _e(sv(row_umba.get("name")))),
             ("Number",  _e(sv(row_umba.get("phoneNumber")))),
             ("Address", _e(u_addr)),
@@ -1354,14 +1649,119 @@ def generate_html_combined(row_main: dict | None, row_umba: dict | None, query: 
             ("Gender",  _e(sv(row_umba.get("gender")))),
             ("Carrier", _e(sv(row_umba.get("carrier")))),
         ]:
-            if val:
-                pairs.append((label, val))
-    else:
-        pairs.append(("KC-SOURCE-02 Status", "<i>No record found</i>"))
+            if v: pairs.append((l, v))
+
+    # KC-SOURCE-03
+    row_bsnl = sources_data.get("bsnl")
+    if row_bsnl:
+        pairs.append(("SECTION:KC-SOURCE-03 · BSNL MOBILE", ""))
+        b_addr = clean_addr(row_bsnl.get("address"))
+        for l, v in [
+            ("Naam",      _e(sv(row_bsnl.get("name")))),
+            ("Number",    _e(sv(row_bsnl.get("number")))),
+            ("Carrier",   _e(sv(row_bsnl.get("carrier")))),
+            ("Gender",    _e(sv(row_bsnl.get("gender")))),
+            ("Address",   _e(b_addr)),
+            ("Job Title", _e(sv(row_bsnl.get("job_title")))),
+            ("Company",   _e(sv(row_bsnl.get("company_name")))),
+            ("Email",     _e(sv(row_bsnl.get("email")))),
+            ("Facebook",  _e(sv(row_bsnl.get("facebook")))),
+            ("Twitter",   _e(sv(row_bsnl.get("twitter")))),
+        ]:
+            if v: pairs.append((l, v))
+
+    # KC-SOURCE-04
+    row_cars = sources_data.get("cars")
+    if row_cars:
+        pairs.append(("SECTION:KC-SOURCE-04 · VEHICLE REGISTRY", ""))
+        c_addr = clean_addr(row_cars.get("address"))
+        for l, v in [
+            ("Naam",       _e(sv(row_cars.get("name")))),
+            ("Mobile",     _e(sv(row_cars.get("mobile_no")))),
+            ("Model",      _e(sv(row_cars.get("model")))),
+            ("Submodel",   _e(sv(row_cars.get("submodel")))),
+            ("Asset Type", _e(sv(row_cars.get("asset_type")))),
+            ("Product",    _e(sv(row_cars.get("product")))),
+            ("Address",    _e(c_addr)),
+            ("City",       _e(sv(row_cars.get("city")))),
+            ("Pin Code",   _e(sv(row_cars.get("pincode")))),
+            ("EMI Amount", _e(sv(row_cars.get("emi_amt")))),
+            ("Tenor",      _e(sv(row_cars.get("tenor")))),
+            ("ROI",        _e(sv(row_cars.get("roi")))),
+            ("Status",     _e(sv(row_cars.get("mis_status")))),
+        ]:
+            if v: pairs.append((l, v))
+
+    # KC-SOURCE-05
+    row_air = sources_data.get("air")
+    if row_air:
+        pairs.append(("SECTION:KC-SOURCE-05 · AIR CELLULAR", ""))
+        a_addr = clean_addr(row_air.get("address"))
+        for l, v in [
+            ("Naam",      _e(sv(row_air.get("name")))),
+            ("Number",    _e(sv(row_air.get("number")))),
+            ("Carrier",   _e(sv(row_air.get("carrier")))),
+            ("Gender",    _e(sv(row_air.get("gender")))),
+            ("Address",   _e(a_addr)),
+            ("Job Title", _e(sv(row_air.get("job_title")))),
+            ("Company",   _e(sv(row_air.get("company_name")))),
+            ("Email",     _e(sv(row_air.get("email")))),
+            ("Facebook",  _e(sv(row_air.get("facebook")))),
+            ("Twitter",   _e(sv(row_air.get("twitter")))),
+        ]:
+            if v: pairs.append((l, v))
+
+    # KC-SOURCE-06
+    row_flip = sources_data.get("flipkart")
+    if row_flip:
+        pairs.append(("SECTION:KC-SOURCE-06 · FLIPKART COMMERCE", ""))
+        f_addr = clean_addr(row_flip.get("address"))
+        f_loc = ", ".join(x for x in [sv(row_flip.get("city")), sv(row_flip.get("state")), sv(row_flip.get("pincode"))] if x)
+        for l, v in [
+            ("Customer Name", _e(sv(row_flip.get("name")))),
+            ("Phone",         _e(sv(row_flip.get("phone")))),
+            ("Email",         _e(sv(row_flip.get("email")))),
+            ("Address",       _e(f_addr)),
+            ("Location",      _e(f_loc)),
+        ]:
+            if v: pairs.append((l, v))
+
+    # KC-SOURCE-07
+    row_tg = sources_data.get("telegram")
+    if row_tg:
+        pairs.append(("SECTION:KC-SOURCE-07 · TELEGRAM MASTER", ""))
+        tg_name = " ".join(x for x in [sv(row_tg.get("first_name")), sv(row_tg.get("last_name"))] if x)
+        for l, v in [
+            ("Name",          _e(tg_name)),
+            ("Username",      _e(sv(row_tg.get("username")))),
+            ("Telegram ID",   _e(sv(row_tg.get("user_id")))),
+            ("Phone",         _e(sv(row_tg.get("phone")))),
+            ("Email",         _e(sv(row_tg.get("email")))),
+            ("Status",        _e(sv(row_tg.get("status")))),
+            ("Linked ID",     _e(sv(row_tg.get("linked_id")))),
+            ("Linked Name",   _e(sv(row_tg.get("linked_name")))),
+            ("Linked Handle", _e(sv(row_tg.get("linked_handle")))),
+        ]:
+            if v: pairs.append((l, v))
 
     memo = f"{_e(BOT_NAME)} verified intelligence multi-source report."
-    name = sv((row_main or {}).get("name")) or sv((row_umba or {}).get("name")) or f"Report for {query}"
-    return _html_page(name, f"{BOT_NAME} · Multi-Source Intelligence", pairs, memo)
+    name = (
+        sv((row_main or {}).get("name"))
+        or sv((row_umba or {}).get("name"))
+        or sv((row_bsnl or {}).get("name"))
+        or sv((row_cars or {}).get("name"))
+        or sv((row_air or {}).get("name"))
+        or sv((row_flip or {}).get("name"))
+        or sv((row_tg or {}).get("first_name"))
+        or f"Report for {query}"
+    )
+    return _html_page(name, f"{BOT_NAME} · Multi-Source Intelligence Dossier", pairs, memo)
+
+def generate_html(row: dict, query: str) -> str:
+    return generate_html_all({"main": row}, query)
+
+def generate_html_combined(row_main: dict | None, row_umba: dict | None, query: str) -> str:
+    return generate_html_all({"main": row_main, "umba": row_umba}, query)
 
 def generate_receipt_html(user: dict, plan: dict, when: str, expiry: str, utr: str = "", gateway: str = "", invoice_id: str = "") -> str:
     pairs = [
@@ -2814,78 +3214,72 @@ def worker() -> None:
 
             edit_msg(cid, mid, msg_searching(query))
 
-            # Run searches concurrently in parallel threads to eliminate latency
+            # Run all 7 source searches concurrently in parallel threads
             stages = _next_load_stages()
-            res_main: list[dict] = []
-            res_umba: list[dict] = []
+            all_sources: dict[str, list[dict]] = {s["id"]: [] for s in SOURCES}
 
-            def _fetch_main():
-                nonlocal res_main
-                try:
-                    res_main = db_search(query)
-                except Exception as ex:
-                    log.warning("KC-SOURCE-01 query error: %s", ex)
-                    res_main = []
-
-            def _fetch_umba():
-                nonlocal res_umba
-                try:
-                    res_umba = db_search_umba(query)
-                except Exception as ex:
-                    log.warning("KC-SOURCE-02 query error: %s", ex)
-                    res_umba = []
+            def _make_fetcher(src_def: dict):
+                def _fetch():
+                    try:
+                        all_sources[src_def["id"]] = src_def["search_fn"](query)
+                    except Exception as ex:
+                        log.warning("%s query error: %s", src_def["name"], ex)
+                        all_sources[src_def["id"]] = []
+                return _fetch
 
             t_db = time.monotonic()
-            th_main = threading.Thread(target=_fetch_main, daemon=True)
-            th_umba = threading.Thread(target=_fetch_umba, daemon=True)
-            th_main.start()
-            th_umba.start()
+            threads = [
+                threading.Thread(target=_make_fetcher(s), daemon=True)
+                for s in SOURCES
+            ]
+            for th in threads:
+                th.start()
 
             # Display quick animated hacker stages
             for label in stages[:2]:
                 time.sleep(_STAGE_GAP)
                 edit_msg(cid, mid, msg_stage(query, label))
 
-            th_main.join(timeout=15.0)
-            th_umba.join(timeout=15.0)
-            elapsed = time.monotonic() - t_db
+            for th in threads:
+                th.join(timeout=15.0)
 
-            rows_main = res_main
-            rows_umba = res_umba
+            elapsed = time.monotonic() - t_db
 
             with _sl:
                 global_stats["searches"] += 1
                 if cid in user_data:
                     user_data[cid]["searches"] += 1
 
-            total = max(len(rows_main), len(rows_umba))
+            total_found = sum(len(r) for r in all_sources.values())
+            max_pages = max([len(r) for r in all_sources.values() if r] or [0])
 
-            if total == 0:
+            if total_found == 0:
                 with _sl:
                     _remember(cid, query, 0)
                 edit_msg(cid, mid, msg_no_result(query), kb=back_kb())
             else:
-                found = len(rows_main) + len(rows_umba)
                 with _sl:
-                    global_stats["results"] += found
+                    global_stats["results"] += total_found
                     if cid in user_data:
-                        user_data[cid]["results"] += found
-                    _remember(cid, query, found)
+                        user_data[cid]["results"] += total_found
+                    _remember(cid, query, total_found)
                     user_sessions[cid] = {
-                        "results":      rows_main,
-                        "results_umba": rows_umba,
+                        "sources":      all_sources,
+                        "results":      all_sources.get("main", []),
+                        "results_umba": all_sources.get("umba", []),
                         "page":         0,
                         "query":        query,
                         "ts":           time.time(),
                     }
-                row_main = rows_main[0] if rows_main else None
-                row_umba = rows_umba[0] if rows_umba else None
+
+                # Page 0: Take first row of each source that found records
+                page_0_data = {k: (v[0] if v else None) for k, v in all_sources.items()}
                 edit_msg(cid, mid, msg_stage(query, "✅ Match mil gaya!"))
                 time.sleep(0.2)
                 edit_msg(
                     cid, mid,
-                    format_card_combined(row_main, row_umba, query, elapsed),
-                    kb=result_kb(0, total),
+                    format_card_sources(page_0_data, query, elapsed),
+                    kb=result_kb(0, max_pages),
                 )
 
         except Exception:
@@ -3349,40 +3743,71 @@ def handle_cb(cb: dict) -> None:
         with _sl:
             sess = user_sessions.get(cid)
         if sess:
-            rows_main = sess.get("results", [])
-            rows_umba = sess.get("results_umba", [])
-            total = max(len(rows_main), len(rows_umba))
-            if 0 <= page < total:
-                row_main = rows_main[page] if page < len(rows_main) else None
-                row_umba = rows_umba[page] if page < len(rows_umba) else None
-                edit_msg(
-                    cid, mid,
-                    format_card_combined(row_main, row_umba, sess["query"]),
-                    kb=result_kb(page, total),
-                )
+            sources = sess.get("sources")
+            if sources:
+                max_pages = max([len(r) for r in sources.values() if r] or [0])
+                if 0 <= page < max_pages:
+                    page_data = {k: (v[page] if page < len(v) else None) for k, v in sources.items()}
+                    edit_msg(
+                        cid, mid,
+                        format_card_sources(page_data, sess["query"]),
+                        kb=result_kb(page, max_pages),
+                    )
+            else:
+                rows_main = sess.get("results", [])
+                rows_umba = sess.get("results_umba", [])
+                total = max(len(rows_main), len(rows_umba))
+                if 0 <= page < total:
+                    row_main = rows_main[page] if page < len(rows_main) else None
+                    row_umba = rows_umba[page] if page < len(rows_umba) else None
+                    edit_msg(
+                        cid, mid,
+                        format_card_combined(row_main, row_umba, sess["query"]),
+                        kb=result_kb(page, total),
+                    )
 
     elif data.startswith("html:"):
         page = int(data.split(":")[1])
         with _sl:
             sess = user_sessions.get(cid)
         if sess:
-            rows_main = sess.get("results", [])
-            rows_umba = sess.get("results_umba", [])
-            row_main = rows_main[page] if page < len(rows_main) else None
-            row_umba = rows_umba[page] if page < len(rows_umba) else None
             query = sess["query"]
-            if row_main is not None or row_umba is not None:
+            sources = sess.get("sources")
+            if sources:
+                page_data = {k: (v[page] if page < len(v) else (v[0] if v else None)) for k, v in sources.items()}
                 phone = (
-                    sv((row_main or {}).get("phoneNumber"))
-                    or sv((row_umba or {}).get("phoneNumber"))
-                    or "note"
+                    sv((page_data.get("main") or {}).get("phoneNumber"))
+                    or sv((page_data.get("umba") or {}).get("phoneNumber"))
+                    or sv((page_data.get("bsnl") or {}).get("number"))
+                    or sv((page_data.get("cars") or {}).get("mobile_no"))
+                    or sv((page_data.get("air") or {}).get("number"))
+                    or sv((page_data.get("flipkart") or {}).get("phone"))
+                    or sv((page_data.get("telegram") or {}).get("phone"))
+                    or query
                 )
                 send_html_file(
                     cid,
                     f"{BOT_NAME}_Report_{phone}.html",
-                    generate_html_combined(row_main, row_umba, query),
-                    "📄 Le bhai, teri KC directory note attach hai.",
+                    generate_html_all(page_data, query),
+                    "📄 Le bhai, teri KC multi-source intelligence report attach hai.",
                 )
+            else:
+                rows_main = sess.get("results", [])
+                rows_umba = sess.get("results_umba", [])
+                row_main = rows_main[page] if page < len(rows_main) else None
+                row_umba = rows_umba[page] if page < len(rows_umba) else None
+                if row_main is not None or row_umba is not None:
+                    phone = (
+                        sv((row_main or {}).get("phoneNumber"))
+                        or sv((row_umba or {}).get("phoneNumber"))
+                        or "note"
+                    )
+                    send_html_file(
+                        cid,
+                        f"{BOT_NAME}_Report_{phone}.html",
+                        generate_html_combined(row_main, row_umba, query),
+                        "📄 Le bhai, teri KC directory note attach hai.",
+                    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  COMMAND DISPATCH
