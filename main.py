@@ -579,10 +579,21 @@ def _seed_settings() -> None:
 
 def _bootstrap_sqlite() -> None:
     global _sql, MAINTENANCE
+    auto_init = os.getenv("AUTO_INIT_DB", "1").lower() in ("1", "true", "yes")
     if not os.path.isfile(_DB_PATH):
-        MAINTENANCE = True
-        log.error("users.db missing — maintenance, empty database will not be created")
-        return
+        if auto_init:
+            log.info("users.db missing on fresh container — auto-initializing fresh database...")
+            err = _create_fresh_db()
+            if err:
+                MAINTENANCE = True
+                log.error("Failed to auto-init users.db: %s", err)
+            else:
+                log.info("✅ Auto-initialized fresh users.db at %s", _DB_PATH)
+            return
+        else:
+            MAINTENANCE = True
+            log.error("users.db missing — maintenance, empty database will not be created (AUTO_INIT_DB=0)")
+            return
     try:
         _sql = sqlite3.connect(_DB_PATH, check_same_thread=False)
         _sql.row_factory = sqlite3.Row
@@ -4119,7 +4130,7 @@ def poll_telegram() -> None:
         except Exception:
             time.sleep(3)
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"status": "alive", "queue": _search_q.qsize(), "maintenance": MAINTENANCE}
 
