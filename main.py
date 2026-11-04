@@ -63,9 +63,9 @@ BASE_URL         = f"https://api.telegram.org/bot{TOKEN}"
 #  MANUAL SYSTEM CONFIGURATION (TUNE HERE FOR ANY SERVER / HOSTING SPECS)
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configure your server architecture settings manually here (or via environment variables):
-SYS_RAM_LIMIT          = os.getenv("SYS_RAM_LIMIT",          "350MB")  # DuckDB memory limit (e.g. '300MB', '500MB', '1GB', '2GB')
-SYS_CPU_THREADS        = int(os.getenv("SYS_CPU_THREADS",    "2"))      # CPU worker threads for DuckDB (e.g. 1, 2, 4)
-SYS_CONCURRENT_SOURCES = int(os.getenv("SYS_CONCURRENT_SOURCES", "3"))  # Max sources queried at a time (1 to 7). Set 2 or 3 for 512MB Render!
+SYS_RAM_LIMIT          = os.getenv("SYS_RAM_LIMIT",          "500MB")  # DuckDB memory limit (e.g. '300MB', '500MB', '1GB', '2GB')
+SYS_CPU_THREADS        = int(os.getenv("SYS_CPU_THREADS",    "1"))      # CPU worker threads for DuckDB (e.g. 1, 2, 4)
+SYS_CONCURRENT_SOURCES = int(os.getenv("SYS_CONCURRENT_SOURCES", "2"))  # Max sources queried at a time (1 to 7). Set 2 or 3 for 512MB Render!
 SYS_SEARCH_TIMEOUT     = float(os.getenv("SYS_SEARCH_TIMEOUT", "15.0")) # Query search timeout in seconds
 SYS_MAX_QUEUE          = int(os.getenv("SYS_MAX_QUEUE",      "20"))     # Maximum search queue capacity
 SYS_HTTP_TIMEOUT_MS    = int(os.getenv("SYS_HTTP_TIMEOUT_MS", "15000")) # DuckDB remote parquet HTTP timeout (ms)
