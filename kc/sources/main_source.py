@@ -40,3 +40,4 @@ def _format_main_block(row: dict) -> list[str]:
     if loc:          lines.append(f"  📍 <b>Location:</b> {_e(loc)}")
     if pincode:      lines.append(f"  📮 <b>Zip:</b> <code>{_e(pincode)}</code>")
     return lines
+
