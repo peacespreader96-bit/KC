@@ -123,10 +123,15 @@ def worker() -> None:
 
             stages = _next_load_stages()
             all_sources: dict[str, list[dict]] = {s["id"]: [] for s in SOURCES}
+            cancelled = threading.Event()
 
             def _make_fetcher(src_def: dict):
                 def _fetch():
+                    if cancelled.is_set():
+                        return
                     with shared._source_semaphore:
+                        if cancelled.is_set():
+                            return
                         try:
                             all_sources[src_def["id"]] = src_def["search_fn"](query)
                         except Exception as ex:
@@ -153,6 +158,9 @@ def worker() -> None:
                 if th.is_alive():
                     log.warning("Source %s query timed out", s["id"])
                     all_sources[s["id"]] = []
+
+            # Signal any remaining or queued threads to bail out immediately
+            cancelled.set()
 
             elapsed = time.monotonic() - t_db
 
