@@ -304,12 +304,22 @@ def bootstrap() -> None:
 
     log.info("⏳ Initialising DuckDB connection …")
     shared.db = duckdb.connect(config={"custom_user_agent": _UA})
-    shared.db.execute(
-        f"SET memory_limit='{shared.SYS_RAM_LIMIT}'; "
-        f"SET threads={shared.SYS_CPU_THREADS}; "
-        f"SET http_timeout={shared.SYS_HTTP_TIMEOUT_MS}; "
-        f"SET enable_progress_bar=false;"
-    )
+    try:
+        shared.db.execute(
+            f"SET memory_limit='{shared.SYS_RAM_LIMIT}'; "
+            f"SET threads={shared.SYS_CPU_THREADS}; "
+            f"SET http_timeout={shared.SYS_HTTP_TIMEOUT_MS}; "
+            f"SET enable_object_cache=true; "
+            f"SET preserve_insertion_order=false; "
+            f"SET enable_progress_bar=false;"
+        )
+    except Exception:
+        shared.db.execute(
+            f"SET memory_limit='{shared.SYS_RAM_LIMIT}'; "
+            f"SET threads={shared.SYS_CPU_THREADS}; "
+            f"SET http_timeout={shared.SYS_HTTP_TIMEOUT_MS}; "
+            f"SET enable_progress_bar=false;"
+        )
     shared._duckdb_applied_cfg = {
         "ram": shared.SYS_RAM_LIMIT,
         "threads": shared.SYS_CPU_THREADS,
@@ -330,3 +340,4 @@ def bootstrap() -> None:
         except Exception as _ex:
             shared._view_health[vname] = False
             log.warning("DuckDB view init notice (%s): %s (marked unhealthy)", vname, _ex)
+
