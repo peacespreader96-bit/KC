@@ -41,3 +41,4 @@ def _format_telegram_block(row: dict) -> list[str]:
         acc = " · ".join(x for x in [linked_name, linked_handle, linked_id] if x)
         lines.append(f"  🔗 <b>Linked:</b> {_e(acc)}")
     return lines
+
