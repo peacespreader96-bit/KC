@@ -252,3 +252,4 @@ def _notify_referral_premium(inviter_id: int, until: float) -> None:
         + "\n".join(f"• {_e(name)}" for name in names)
         + f"\n\nPremium <b>{_e(fmt_until(until))}</b> tak chalega.",
     )
+
