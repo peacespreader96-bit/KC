@@ -205,6 +205,16 @@ def _safe_query(sql: str, params: list, source_name: str = "") -> list[dict]:
         finally:
             cur.close()
     except Exception as ex:
+        ex_str = str(ex)
+        if "TProtocolException" in ex_str or "Invalid data" in ex_str:
+            if source_name:
+                shared._source_query_error[source_name] = True
+                for sid, vname in _SRC_VIEW_MAP.items():
+                    if sid.lower() in source_name.lower():
+                        shared._view_health[vname] = False
+            log.error("DuckDB unrecoverable query error [%s]: %s (skipping retry)", source_name or "DB", ex)
+            return []
+
         with shared._db_lock:
             try:
                 cur = shared.db.cursor()
@@ -218,6 +228,9 @@ def _safe_query(sql: str, params: list, source_name: str = "") -> list[dict]:
             except Exception as ex2:
                 if source_name:
                     shared._source_query_error[source_name] = True
+                    for sid, vname in _SRC_VIEW_MAP.items():
+                        if sid.lower() in source_name.lower():
+                            shared._view_health[vname] = False
                 log.error("DuckDB query failed [%s]: %s (initial: %s)", source_name or "DB", ex2, ex)
                 return []
 
