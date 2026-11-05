@@ -40,3 +40,4 @@ def _broadcast(audience: str, text: str) -> None:
             send_msg(ADMIN_ID, f"Broadcast progress · {i}/{len(rows)} sent · {sent} ok · {failed} fail")
     who = "Premium walon" if audience == "prem" else "sab members"
     send_msg(ADMIN_ID, f"Broadcast {who} ko band. Pahuncha · <b>{sent}</b>. Nahi pahuncha · <b>{failed}</b>.")
+
