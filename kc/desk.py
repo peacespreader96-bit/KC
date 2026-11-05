@@ -617,3 +617,4 @@ def _handle_desk_cb(cid: int, mid: int, data: str) -> None:
 
 # Up-call registration
 shared._poke_desks_fn = _poke_desks
+
