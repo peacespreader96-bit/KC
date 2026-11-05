@@ -116,3 +116,4 @@ def _download_tg_file(file_id: str) -> bytes | None:
     except Exception:
         log.exception("telegram file download failed")
         return None
+
