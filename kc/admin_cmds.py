@@ -486,3 +486,4 @@ def _toggle_gateway(gw: str) -> str:
         return f"{gw} band kar diya."
     _kv_set(f"gw:{gw}", "1")
     return f"{gw} chalu kar diya."
+
