@@ -11,7 +11,10 @@ def _spoiler(value: str) -> str:
 def db_search_air(number: str) -> list[dict]:
     vname = "people_air"
     if not shared._view_health.get(vname, True):
-        recreate_view(vname)
+        if not shared._source_query_error.get("KC-SOURCE-05", False):
+            recreate_view(vname)
+        else:
+            return []
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_air WHERE number IN ({ph}) LIMIT 5"
