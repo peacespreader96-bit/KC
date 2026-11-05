@@ -11,12 +11,12 @@ _duckdb_applied_cfg: dict = {}
 
 # --- System config (mutated by /sysconfig) ---
 MAINTENANCE: bool = True   # safe default; cleared by startup_health
-SYS_RAM_LIMIT: str = ""
-SYS_CPU_THREADS: int = 1
-SYS_CONCURRENT_SOURCES: int = 1
-SYS_SEARCH_TIMEOUT: float = 15.0
+SYS_RAM_LIMIT: str = "350MB"
+SYS_CPU_THREADS: int = 4
+SYS_CONCURRENT_SOURCES: int = 7
+SYS_SEARCH_TIMEOUT: float = 120.0
 SYS_MAX_QUEUE: int = 20
-SYS_HTTP_TIMEOUT_MS: int = 60000
+SYS_HTTP_TIMEOUT_MS: int = 120000
 
 # --- View health ---
 _view_health: dict[str, bool] = {}
@@ -51,3 +51,4 @@ _log_lock = threading.Lock()
 # Modules that need "up-calls" register here at import time.
 _poke_desks_fn = lambda: None
 _show_dashboard_fn = lambda cid, mid=None: None
+
