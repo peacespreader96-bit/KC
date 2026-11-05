@@ -34,3 +34,4 @@ def _format_flipkart_block(row: dict) -> list[str]:
     loc = ", ".join(x for x in [city, state, pincode] if x)
     if loc:     lines.append(f"  📍 <b>Location:</b> {_e(loc)}")
     return lines
+
