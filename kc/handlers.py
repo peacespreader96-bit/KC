@@ -637,7 +637,7 @@ def handle_msg(msg: dict) -> None:
     with shared._sl:
         user = _get_ud(cid, name=name, username=un)
 
-    if cid != ADMIN_ID and shared.MAINTENANCE:
+    if shared.MAINTENANCE:
         send_msg(cid, _MAINT_TEXT)
         return
 

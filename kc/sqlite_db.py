@@ -232,7 +232,6 @@ def _create_fresh_db() -> str | None:
             shared._sql.row_factory = sqlite3.Row
             _init_sqlite()
             _seed_settings()
-            shared.MAINTENANCE = False
             log.info("✅ Fresh SQLite DB created by admin request")
             return None
         except Exception as exc:

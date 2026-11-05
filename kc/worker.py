@@ -210,7 +210,7 @@ def worker() -> None:
 
 
 def _enqueue_search(cid: int, query: str) -> None:
-    if shared.MAINTENANCE and cid != ADMIN_ID:
+    if shared.MAINTENANCE:
         send_msg(cid, _MAINT_TEXT)
         return
     with shared._sl:
@@ -256,7 +256,7 @@ def _enqueue_search(cid: int, query: str) -> None:
 
         mid = send_msg(cid, msg_queue(approx_pos, query))
         if not mid:
-            shared.active_users.discard(cid)
+            shared.shared.active_users.discard(cid)
             if counted:
                 user["daily_searches"] = max(0, int(user.get("daily_searches") or 0) - 1)
                 _save_user(user)
