@@ -33,3 +33,4 @@ def _format_umba_block(row: dict) -> list[str]:
     if u_gender:  lines.append(f"  🧬 <b>Gender:</b> {_e(u_gender)}")
     if u_carrier: lines.append(f"  📡 <b>Carrier:</b> {_e(u_carrier)}")
     return lines
+
