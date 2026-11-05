@@ -326,3 +326,4 @@ def _restore_db(blob: bytes) -> str | None:
             f"Par DuckDB health abhi bhi fail hai (<i>{_e(str(exc)[:120])}</i>) — searches tab tak timeout honge.",
         )
     return None
+
