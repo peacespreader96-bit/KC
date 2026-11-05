@@ -45,3 +45,4 @@ def _format_air_block(row: dict) -> list[str]:
     if facebook:     lines.append(f"  🌐 <b>Facebook:</b> <code>{_e(facebook)}</code>")
     if twitter:      lines.append(f"  🐦 <b>Twitter:</b> <code>{_e(twitter)}</code>")
     return lines
+
