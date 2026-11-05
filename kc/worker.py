@@ -27,7 +27,7 @@ from kc.user_ops import (
     _remember,
     _touch_streak,
 )
-from kc.utils import _today
+from kc.utils import _today, _e
 
 _HACKER_STAGES = (
     "Firewall tod raha hoon...",
@@ -107,7 +107,12 @@ def _q_pos(cid: int) -> int:
 
 def worker() -> None:
     while True:
-        cid, query, mid = shared._search_q.get()
+        task = shared._search_q.get()
+        if len(task) == 4:
+            cid, query, mid, target_source = task
+        else:
+            cid, query, mid = task
+            target_source = None
         try:
             tg("sendChatAction", {"chat_id": cid, "action": "typing"})
             with shared._ql:
@@ -119,7 +124,16 @@ def worker() -> None:
                 except Exception:
                     pass
 
-            edit_msg(cid, mid, msg_searching(query))
+            if target_source and target_source != "all":
+                active_sources = [s for s in SOURCES if s["id"] == target_source]
+                if not active_sources:
+                    active_sources = SOURCES
+                src_label = active_sources[0]["name"]
+                search_txt = f'⚡ <b>Searching {src_label}...</b>\n🔎 <code>{_e(query)}</code>'
+                edit_msg(cid, mid, search_txt)
+            else:
+                active_sources = SOURCES
+                edit_msg(cid, mid, msg_searching(query))
 
             stages = _next_load_stages()
             all_sources: dict[str, list[dict]] = {s["id"]: [] for s in SOURCES}
@@ -143,7 +157,7 @@ def worker() -> None:
             t_db = time.monotonic()
             threads = [
                 (s, threading.Thread(target=_make_fetcher(s), daemon=True))
-                for s in SOURCES
+                for s in active_sources
             ]
             for _, th in threads:
                 th.start()
@@ -152,9 +166,16 @@ def worker() -> None:
                 time.sleep(_STAGE_GAP)
                 edit_msg(cid, mid, msg_stage(query, label))
 
+            while time.monotonic() < deadline:
+                all_done = all(not th.is_alive() for _, th in threads)
+                found_count = sum(1 for s in active_sources if all_sources.get(s["id"]))
+                if all_done:
+                    break
+                if len(active_sources) > 1 and found_count >= 3 and (time.monotonic() - t_db >= 10.0):
+                    break
+                time.sleep(0.3)
+
             for s, th in threads:
-                remaining = max(0.0, deadline - time.monotonic())
-                th.join(remaining)
                 if th.is_alive():
                     log.warning("Source %s query timed out", s["id"])
                     all_sources[s["id"]] = []
@@ -175,7 +196,14 @@ def worker() -> None:
             if total_found == 0:
                 with shared._sl:
                     _remember(cid, query, 0)
-                edit_msg(cid, mid, msg_no_result(query), kb=back_kb())
+                edit_msg(
+                    cid, mid,
+                    msg_no_result(query),
+                    kb=[
+                        [{"text": "🔄 Doosra Source Check Kar", "callback_data": f"chgsrc:{query}"}],
+                        [{"text": "🔍 Nayi Search", "callback_data": "new_search"}, {"text": "🏠 Main Menu", "callback_data": "dashboard"}],
+                    ],
+                )
             else:
                 with shared._sl:
                     shared.global_stats["results"] += total_found
@@ -197,7 +225,7 @@ def worker() -> None:
                 edit_msg(
                     cid, mid,
                     format_card_sources(page_0_data, query, elapsed),
-                    kb=result_kb(0, max_pages),
+                    kb=result_kb(0, max_pages, query),
                 )
 
         except Exception:
@@ -209,7 +237,7 @@ def worker() -> None:
             shared._search_q.task_done()
 
 
-def _enqueue_search(cid: int, query: str) -> None:
+def _enqueue_search(cid: int, query: str, target_source: str | None = None) -> None:
     if shared.MAINTENANCE:
         send_msg(cid, _MAINT_TEXT)
         return
@@ -264,4 +292,5 @@ def _enqueue_search(cid: int, query: str) -> None:
 
         with shared._ql:
             shared._queue_order.append({"chat_id": cid, "msg_id": mid, "query": query, "enqueued_at": time.time()})
-        shared._search_q.put((cid, query, mid))
+        shared._search_q.put((cid, query, mid, target_source))
+
