@@ -52,3 +52,4 @@ def _format_cars_block(row: dict) -> list[str]:
         lines.append(f"  📈 <b>Rate:</b> {_e(rates)}")
     if mis_status:  lines.append(f"  📊 <b>Status:</b> {_e(mis_status)}")
     return lines
+
