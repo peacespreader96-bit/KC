@@ -85,7 +85,7 @@ def _gateway_kb(plan_id: str):
     return rows
 
 
-def result_kb(page: int, total: int):
+def result_kb(page: int, total: int, query: str = ""):
     rows = []
     if total > 1:
         nav = []
@@ -95,15 +95,61 @@ def result_kb(page: int, total: int):
         if page < total - 1:
             nav.append({"text": "Agla ▶️", "callback_data": f"pg:{page + 1}"})
         rows.append(nav)
+    action_row = [{"text": "📄 Download Report", "callback_data": f"html:{page}"}]
+    if query:
+        action_row.append({"text": "🔄 Doosra Source", "callback_data": f"chgsrc:{query}"})
+    else:
+        action_row.append({"text": "🔍 Nayi Search", "callback_data": "new_search"})
+    rows.append(action_row)
     rows.append([
-        {"text": "📄 Download Report", "callback_data": f"html:{page}"},
         {"text": "🔍 Nayi Search", "callback_data": "new_search"},
-    ])
-    rows.append([
         {"text": "🏠 Main Menu", "callback_data": "dashboard"},
         {"text": "👑 Premium", "callback_data": "premium"},
     ])
     return rows
+
+
+def source_select_kb(query: str):
+    return [
+        [
+            {"text": "🛍️ Flipkart E-Comm (Fast)", "callback_data": f"src:flipkart:{query}"},
+            {"text": "📡 BSNL Mobile", "callback_data": f"src:bsnl:{query}"},
+        ],
+        [
+            {"text": "📁 KC-01 Core Citizen", "callback_data": f"src:main:{query}"},
+            {"text": "📂 KC-02 Telecom Archive", "callback_data": f"src:umba:{query}"},
+        ],
+        [
+            {"text": "🚗 KC-04 Vehicle Registry", "callback_data": f"src:cars:{query}"},
+            {"text": "✈️ KC-07 Telegram Master", "callback_data": f"src:telegram:{query}"},
+        ],
+        [
+            {"text": "⚡ Sabhi Databases (Search All)", "callback_data": f"src:all:{query}"},
+        ],
+        [
+            {"text": "🔙 Main Menu", "callback_data": "dashboard"},
+        ],
+    ]
+
+
+def msg_source_select(query: str) -> str:
+    lines = [
+        f"🎯 <b>Target Number:</b> <code>{_e(query)}</code>",
+        "",
+        "Kaunse database repository mein check karna hai bhai? Ek source choose kar turant 1-3 seconds mein search ke liye:",
+        "",
+        "• 🛍️ <b>Flipkart:</b> E-commerce delivery & customer directory (Super fast ⚡)",
+        "• 📡 <b>BSNL Mobile:</b> 18.1M telecom numbers & job profiles",
+        "• 📁 <b>KC-01 Core:</b> Citizen records, Aadhaar & address",
+        "• 📂 <b>KC-02 Umba:</b> Archived carrier and telecom logs",
+        "• 🚗 <b>KC-04 Cars:</b> Vehicle ownership & loan registry",
+        "• ✈️ <b>KC-07 Telegram:</b> Master 429M Telegram account DB",
+        "",
+        "<i>💡 Specific database choose karne se search 1-3 seconds mein turant aati hai bina timeout ke!</i>",
+        "",
+        _D,
+    ]
+    return chr(10).join(lines)
 
 
 def force_kb():
@@ -286,3 +332,4 @@ def msg_welcome(name: str) -> str:
         "id": 0, "name": name, "is_premium": False, "premium_until": 0,
         "daily_searches": 0, "last_search_date": "", "searches": 0,
     })
+
