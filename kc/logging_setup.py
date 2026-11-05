@@ -21,3 +21,4 @@ logging.basicConfig(level=logging.INFO, format=_FMT, datefmt=_TIME)
 if _ring not in logging.getLogger().handlers:
     logging.getLogger().addHandler(_ring)
 log = logging.getLogger("bot")
+
