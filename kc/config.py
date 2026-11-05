@@ -23,12 +23,12 @@ DUCKDB_MEM_LIMIT = os.getenv("DUCKDB_MEM_LIMIT", "500MB")
 DUCKDB_THREADS   = int(os.getenv("DUCKDB_THREADS", "4"))
 BASE_URL         = f"https://api.telegram.org/bot{TOKEN}"
 
-SYS_RAM_LIMIT_INIT          = os.getenv("SYS_RAM_LIMIT",          "250MB")
-SYS_CPU_THREADS_INIT        = int(os.getenv("SYS_CPU_THREADS",    "2"))
+SYS_RAM_LIMIT_INIT          = os.getenv("SYS_RAM_LIMIT",          "350MB")
+SYS_CPU_THREADS_INIT        = int(os.getenv("SYS_CPU_THREADS",    "4"))
 SYS_CONCURRENT_SOURCES_INIT = int(os.getenv("SYS_CONCURRENT_SOURCES", "7"))
-SYS_SEARCH_TIMEOUT_INIT     = float(os.getenv("SYS_SEARCH_TIMEOUT", "60.0"))
+SYS_SEARCH_TIMEOUT_INIT     = float(os.getenv("SYS_SEARCH_TIMEOUT", "120.0"))
 SYS_MAX_QUEUE_INIT          = int(os.getenv("SYS_MAX_QUEUE",      "20"))
-SYS_HTTP_TIMEOUT_MS_INIT    = int(os.getenv("SYS_HTTP_TIMEOUT_MS", "60000"))
+SYS_HTTP_TIMEOUT_MS_INIT    = int(os.getenv("SYS_HTTP_TIMEOUT_MS", "120000"))
 SYS_HTTP_POOL_CONN          = int(os.getenv("SYS_HTTP_POOL_CONN", "25"))
 SYS_HTTP_POOL_MAX           = int(os.getenv("SYS_HTTP_POOL_MAX",  "50"))
 
@@ -80,3 +80,4 @@ _RECEIPT_DIR = os.path.join(_ROOT_DIR, "receipts")
 _BAN_TEXT    = "Bhai tera ID ban hai. Koi feature nahi chalega — desk band. Operator se baat kar, yahan rona band."
 _MAINT_TEXT  = "Bhai system maintenance mein hai, thodi der baad aana."
 _UA          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
