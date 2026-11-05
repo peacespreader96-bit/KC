@@ -84,3 +84,4 @@ def _can_touch_ticket(cid: int, row: sqlite3.Row) -> bool:
     if row["status"] != "claimed":
         return True
     return int(row["agent_id"] or 0) == cid
+
