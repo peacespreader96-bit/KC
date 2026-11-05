@@ -25,8 +25,8 @@ BASE_URL         = f"https://api.telegram.org/bot{TOKEN}"
 
 SYS_RAM_LIMIT_INIT          = os.getenv("SYS_RAM_LIMIT",          "250MB")
 SYS_CPU_THREADS_INIT        = int(os.getenv("SYS_CPU_THREADS",    "1"))
-SYS_CONCURRENT_SOURCES_INIT = int(os.getenv("SYS_CONCURRENT_SOURCES", "1"))
-SYS_SEARCH_TIMEOUT_INIT     = float(os.getenv("SYS_SEARCH_TIMEOUT", "15.0"))
+SYS_CONCURRENT_SOURCES_INIT = int(os.getenv("SYS_CONCURRENT_SOURCES", "2"))
+SYS_SEARCH_TIMEOUT_INIT     = float(os.getenv("SYS_SEARCH_TIMEOUT", "45.0"))
 SYS_MAX_QUEUE_INIT          = int(os.getenv("SYS_MAX_QUEUE",      "20"))
 SYS_HTTP_TIMEOUT_MS_INIT    = int(os.getenv("SYS_HTTP_TIMEOUT_MS", "60000"))
 SYS_HTTP_POOL_CONN          = int(os.getenv("SYS_HTTP_POOL_CONN", "25"))
