@@ -21,3 +21,4 @@ SOURCES = [
 
 # Compatibility alias
 db_search = db_search_main
+
