@@ -298,3 +298,4 @@ def send_receipt(cid: int, user: dict, plan: dict, when: str, expiry: str, utr: 
         html,
         f"👑 <b>Premium on hai</b> {_e(expiry)} tak. Memo · <code>{_e(invoice_id or utr)}</code>",
     )
+
