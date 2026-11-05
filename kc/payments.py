@@ -353,3 +353,4 @@ def _handle_stars_paid(msg: dict) -> None:
     send_receipt(cid, snapshot, plan, when, expiry, charge, "Stars", inv)
     send_msg(ADMIN_ID, f"Stars payment paid · <code>{_e(inv)}</code> · <code>{cid}</code> · {_e(plan['name'])} · {stars_paid} stars")
     shared._poke_desks_fn()
+
