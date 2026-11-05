@@ -47,3 +47,4 @@ def fmt_td(secs: int) -> str:
 def _today() -> str: return now_ist().strftime("%Y-%m-%d")
 def _clip(text: str, n: int = 3800) -> str:
     return text if len(text) <= n else text[: n - 24] + "\n\n… kaat diya bhai"
+
