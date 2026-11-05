@@ -83,9 +83,11 @@ from kc.ui import (
     msg_history,
     msg_pricing,
     msg_profile,
+    msg_source_select,
     msg_support_prompt,
     pricing_kb,
     result_kb,
+    source_select_kb,
 )
 from kc.user_ops import (
     _apply_referral,
@@ -379,6 +381,21 @@ def handle_cb(cb: dict) -> None:
         return
 
     answer_cb(cb["id"])
+
+    if data.startswith("src:"):
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            _, src_id, q_num = parts
+            if _guard_join(cid, mid):
+                return
+            _enqueue_search(cid, q_num, target_source=src_id)
+            return
+
+    if data.startswith("chgsrc:"):
+        q_num = data.split(":", 1)[1]
+        desk_edit(cid, mid, msg_source_select(q_num), kb=source_select_kb(q_num))
+        return
+
     with shared._sl:
         user = _get_ud(cid, name=name, username=username)
     if cid != ADMIN_ID and _banned(user):
@@ -552,7 +569,7 @@ def handle_cb(cb: dict) -> None:
                 edit_msg(
                     cid, mid,
                     format_card_sources(page_data, sess["query"]),
-                    kb=result_kb(page, max_pages),
+                    kb=result_kb(page, max_pages, sess["query"]),
                 )
         else:
             rows_main = sess.get("results", [])
@@ -564,7 +581,7 @@ def handle_cb(cb: dict) -> None:
                 edit_msg(
                     cid, mid,
                     format_card_combined(row_main, row_umba, sess["query"]),
-                    kb=result_kb(page, total),
+                    kb=result_kb(page, total, sess["query"]),
                 )
 
     elif data.startswith("html:"):
@@ -781,8 +798,9 @@ def handle_msg(msg: dict) -> None:
     if not (raw.isdigit() and len(raw) == 10):
         send_msg(cid, get_text(cid, "invalid"), kb=back_kb())
         return
-    _enqueue_search(cid, raw)
+    send_msg(cid, msg_source_select(raw), kb=source_select_kb(raw))
 
 
 # Up-call registration
 shared._show_dashboard_fn = _show_dashboard
+
