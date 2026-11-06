@@ -1,23 +1,25 @@
-"""KaramChand bot — entrypoint. `uvicorn main:app`."""
-import os
-import threading#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-KaramChand OSINT Telegram Bot · Enterprise Multi-Source Edition
-FastAPI + DuckDB (httpfs/HuggingFace) + Long Polling + SQLite members
-Optimized for ultra-fast multi-source lookups across 7 distinct repositories:
-  • KC-SOURCE-01 : Core Telecom & Citizen File (Hitek mixed)
-  • KC-SOURCE-02 : Telecom Archive (Umba bucket)
-  • KC-SOURCE-03 : BSNL Mobile Directory (18.1M records)
-  • KC-SOURCE-04 : Indian Cars & Asset Registry (966k records)
-  • KC-SOURCE-05 : Cellular Air Repository (73.1M records)
-  • KC-SOURCE-06 : E-Commerce Customer Directory (3.8M records)
-  • KC-SOURCE-07 : Telegram Master Registry (429.6M records)
-Reconstructed dynamic UI: only non-empty sources are displayed.
+Merged main.py — Neural Link synthesis of Bot A and Bot B.
+Enterprise Multi-Source OSINT Telegram Engine (FastAPI + DuckDB + SQLite WAL + Connection Pooling)
 """
 
 import csv
 import io
 import json
+
+try:
+    import orjson
+    def _json_dumps(obj, sort_keys=False):
+        opts = orjson.OPT_SORT_KEYS if sort_keys else 0
+        return orjson.dumps(obj, option=opts).decode('utf-8')
+    def _json_loads(s):
+        return orjson.loads(s)
+except ImportError:
+    import json
+    def _json_dumps(obj, sort_keys=False):
+        return json.dumps(obj, sort_keys=sort_keys, ensure_ascii=False)
+    _json_loads = json.loads
 import logging
 import os
 import random
@@ -27,6 +29,8 @@ import sqlite3
 import sys
 import threading
 import time
+import functools
+import concurrent.futures
 import html as html_lib
 import queue as _queue_mod
 import urllib.parse
@@ -37,6 +41,19 @@ from datetime import datetime, timezone, timedelta
 import duckdb
 import requests
 from fastapi import FastAPI
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PRE-COMPILED REGULAR EXPRESSIONS (Ultra-fast zero-allocation pattern reuse)
+# ═══════════════════════════════════════════════════════════════════════════════
+_RE_DIGITS      = re.compile(r"\D")
+_RE_EXCLAMATION = re.compile(r"!+")
+_RE_WHITESPACE  = re.compile(r"\s+")
+_RE_INT         = re.compile(r"-?\d+")
+_RE_REF         = re.compile(r"ref_(\d+)")
+_RE_UTR         = re.compile(r"\d{12}")
+_RE_TX          = re.compile(r"[A-Za-z0-9]{16,80}")
+_RE_CHANNEL_ID  = re.compile(r"-100\d+")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -53,6 +70,7 @@ USDT_BEP20  = os.getenv("USDT_BEP20", "0x000000000000000000000000000000000000000
 USDT_TRC20  = os.getenv("USDT_TRC20", "TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXx")
 BASE_HF          = os.getenv("BASE_HF",          "hf://buckets/CutehackX/icrm-hitek-full-db-mixed-bucket/")
 BASE_HF_UMBA     = os.getenv("BASE_HF_UMBA",     "hf://buckets/Khanenterprises/umba-bucket/")
+PARQUET_PARTS_UMBA = int(os.getenv("PARQUET_PARTS_UMBA", "7"))
 BASE_HF_BSNL     = os.getenv("BASE_HF_BSNL",     "hf://buckets/Khanenterprises/Bsnalumba/19M-BSNL_Mobile.parquet")
 BASE_HF_CAR      = os.getenv("BASE_HF_CAR",      "hf://buckets/Khanenterprises/Carumba/Indian Cars Owner Details.parquet")
 BASE_HF_AIR      = os.getenv("BASE_HF_AIR",      "hf://buckets/Khanenterprises/Umbaairbucket/data.parquet")
@@ -120,12 +138,16 @@ def configure_system_settings(
         if "db" in globals() and db is not None:
             if target_cfg != _duckdb_applied_cfg:
                 try:
-                    db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS};")
+                    db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS}; SET enable_object_cache=true; SET http_keep_alive=true; SET enable_progress_bar=false;")
                     _duckdb_applied_cfg = dict(target_cfg)
                     log.info("✅ Manual system settings applied to DuckDB · RAM: %s, Threads: %d, Concurrent: %d",
                              SYS_RAM_LIMIT, SYS_CPU_THREADS, SYS_CONCURRENT_SOURCES)
                 except Exception as exc:
-                    log.warning("Notice on manual DuckDB tuning: %s", exc)
+                    try:
+                        db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS}; SET enable_progress_bar=false;")
+                        _duckdb_applied_cfg = dict(target_cfg)
+                    except Exception as exc2:
+                        log.warning("Notice on manual DuckDB tuning: %s", exc2)
 
     return {
         "ram_limit": SYS_RAM_LIMIT,
@@ -140,7 +162,7 @@ FORCE_CHANNELS: list[str] = []
 _fc_env = os.getenv("FORCE_CHANNELS", "").strip()
 if _fc_env:
     try:
-        FORCE_CHANNELS = json.loads(_fc_env) if _fc_env.startswith("[") else [x.strip() for x in _fc_env.split(",") if x.strip()]
+        FORCE_CHANNELS = _json_loads(_fc_env) if _fc_env.startswith("[") else [x.strip() for x in _fc_env.split(",") if x.strip()]
     except Exception:
         FORCE_CHANNELS = [x.strip() for x in _fc_env.split(",") if x.strip()]
 
@@ -176,7 +198,7 @@ _GW_MODES          = {
     "stars":  {"stars"},
 }
 
-_HERE        = os.path.dirname(os.path.abspath(__file__))
+_HERE        = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.path.abspath(os.getcwd())
 _DB_PATH     = os.path.join(_HERE, "users.db")
 _BACKUP_DIR  = os.path.join(_HERE, "backups")
 _RECEIPT_DIR = os.path.join(_HERE, "receipts")
@@ -185,17 +207,89 @@ _MAINT_TEXT  = "Bhai system maintenance mein hai, thodi der baad aana."
 MAINTENANCE  = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  HTTP CONNECTION POOLING (High-speed requests to Telegram)
+#  HTTP CONNECTION POOLING & CONCURRENT UPDATE EXECUTOR
 # ═══════════════════════════════════════════════════════════════════════════════
+# High-speed API session with connection pooling and keep-alive
 _session = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(pool_connections=SYS_HTTP_POOL_CONN, pool_maxsize=SYS_HTTP_POOL_MAX, max_retries=1)
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=max(50, SYS_HTTP_POOL_CONN),
+    pool_maxsize=max(100, SYS_HTTP_POOL_MAX),
+    max_retries=1
+)
 _session.mount("https://", _adapter)
 _session.mount("http://", _adapter)
+_session.headers.update({"Connection": "keep-alive"})
+
+# Dedicated session for Telegram long-polling (getUpdates) so 30s long polls never stall API actions
+_poll_session = requests.Session()
+_poll_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=5,
+    pool_maxsize=10,
+    max_retries=2
+)
+_poll_session.mount("https://", _poll_adapter)
+_poll_session.mount("http://", _poll_adapter)
+_poll_session.headers.update({"Connection": "keep-alive"})
+
+# Thread pool for asynchronous, non-blocking processing of incoming Telegram updates
+_update_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=32,
+    thread_name_prefix="tg-worker"
+)
+
+# Persistent thread pool for concurrent multi-source queries
+_source_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(7, SYS_CONCURRENT_SOURCES),
+    thread_name_prefix="src-fetch"
+)
+
+# Message edit deduplication cache (chat_id, mid -> content_hash)
+_last_msg_state: dict[tuple[int, int], str] = {}
+_msg_state_lock = threading.Lock()
+_MSG_STATE_MAX = 4096
+
+def _calc_msg_hash(text: str, kb) -> str:
+    kb_str = _json_dumps(kb, sort_keys=True) if kb else ""
+    return f"{hash(text)}:{hash(kb_str)}"
+
+# Channel membership verification cache (cid, channel -> (timestamp, is_member))
+_member_cache: dict[tuple[int, str], tuple[float, bool]] = {}
+_member_cache_lock = threading.Lock()
+_MEMBER_CACHE_TTL = 180.0
+
+# Multi-source DuckDB in-memory search result cache (source_id, query -> (timestamp, data))
+_SEARCH_CACHE_MAX = 4096
+_SEARCH_CACHE_TTL = 3600.0
+_search_results_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+_search_results_cache_lock = threading.Lock()
+
+def _get_cached_source_search(src_id: str, query: str) -> list[dict] | None:
+    key = (src_id, query)
+    now = time.monotonic()
+    with _search_results_cache_lock:
+        entry = _search_results_cache.get(key)
+        if entry:
+            ts, data = entry
+            if now - ts < _SEARCH_CACHE_TTL:
+                return data
+            del _search_results_cache[key]
+    return None
+
+def _set_cached_source_search(src_id: str, query: str, data: list[dict]) -> None:
+    key = (src_id, query)
+    now = time.monotonic()
+    with _search_results_cache_lock:
+        if len(_search_results_cache) >= _SEARCH_CACHE_MAX:
+            keys = list(_search_results_cache.keys())[: max(1, _SEARCH_CACHE_MAX // 10)]
+            for k in keys:
+                _search_results_cache.pop(k, None)
+        _search_results_cache[key] = (now, data)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LOGGING  ·  12-hour clock
 # ═══════════════════════════════════════════════════════════════════════════════
 class _RingHandler(logging.Handler):
+    __slots__ = ("_buf", "_lk")
     def __init__(self, maxlen: int = 400) -> None:
         super().__init__()
         self._buf: deque[str] = deque(maxlen=maxlen)
@@ -225,15 +319,36 @@ _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
 log.info("⏳ Initialising DuckDB connection …")
 db = duckdb.connect(config={"custom_user_agent": _UA})
 try:
-    db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS}; SET enable_object_cache=true; SET enable_progress_bar=false;")
+    db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS}; SET enable_object_cache=true; SET http_keep_alive=true; SET enable_progress_bar=false;")
 except Exception:
-    db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS}; SET enable_progress_bar=false;")
+    try:
+        db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS}; SET enable_object_cache=true; SET enable_progress_bar=false;")
+    except Exception:
+        db.execute(f"SET memory_limit='{SYS_RAM_LIMIT}'; SET threads={SYS_CPU_THREADS}; SET http_timeout={SYS_HTTP_TIMEOUT_MS}; SET enable_progress_bar=false;")
 _duckdb_applied_cfg = {
     "ram": SYS_RAM_LIMIT,
     "threads": SYS_CPU_THREADS,
     "http_timeout": SYS_HTTP_TIMEOUT_MS,
 }
 db.execute("INSTALL httpfs; LOAD httpfs;")
+
+# Register Hugging Face HfFileSystem for seamless hf://buckets/ support in DuckDB
+try:
+    from huggingface_hub import HfFileSystem
+    _hf_tok = HF_TOKEN if (HF_TOKEN and HF_TOKEN != "hf_YOUR_READ_TOKEN_HERE") else None
+    _fs = HfFileSystem(token=_hf_tok)
+    try:
+        duckdb.register_filesystem(_fs)
+    except Exception:
+        pass
+    try:
+        db.register_filesystem(_fs)
+    except Exception:
+        pass
+    log.info("✅ HuggingFace HfFileSystem registered with DuckDB for storage buckets")
+except Exception as _fs_ex:
+    log.debug("HfFileSystem notice: %s", _fs_ex)
+
 if HF_TOKEN and HF_TOKEN != "hf_YOUR_READ_TOKEN_HERE":
     try:
         db.execute(f"CREATE SECRET (TYPE HUGGINGFACE, TOKEN '{HF_TOKEN}');")
@@ -246,7 +361,7 @@ PARQUET_PARTS = 7
 _phone_urls = [f"{BASE_HF}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS)]
 _phone_url_list = "[" + ", ".join(f"'{u}'" for u in _phone_urls) + "]"
 
-_umba_urls = [f"{BASE_HF_UMBA}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS)]
+_umba_urls = [f"{BASE_HF_UMBA}idx_phone.{i}.parquet" for i in range(PARQUET_PARTS_UMBA)]
 _umba_url_list = "[" + ", ".join(f"'{u}'" for u in _umba_urls) + "]"
 
 _VIEW_DEFS = [
@@ -402,12 +517,25 @@ _db_lock = threading.RLock()
 
 def _to_dicts(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     cols = [d[0] for d in conn.description]
-    return [{c: (None if str(v) == "nan" else v) for c, v in zip(cols, row)} for row in conn.fetchall()]
+    rows = conn.fetchall()
+    res = []
+    for row in rows:
+        d = {}
+        for c, v in zip(cols, row):
+            if v is None or v == "nan":
+                d[c] = None
+            elif isinstance(v, float) and (v != v):
+                d[c] = None
+            else:
+                d[c] = v
+        res.append(d)
+    return res
 
+@functools.lru_cache(maxsize=4096)
 def _phone_variants(raw_number: str) -> list[str]:
     """Generates standard Indian phone formatting variants for exact Parquet pushdown matching."""
     s = str(raw_number).strip()
-    digits = re.sub(r"\D", "", s)
+    digits = _RE_DIGITS.sub("", s)
     if len(digits) == 12 and digits.startswith("91"):
         d10 = digits[2:]
     elif len(digits) == 11 and digits.startswith("0"):
@@ -417,14 +545,15 @@ def _phone_variants(raw_number: str) -> list[str]:
     else:
         d10 = digits
 
+    p5_a, p5_b = d10[:5], d10[5:]
     variants = [
         d10,
         f"91{d10}",
         f"+91{d10}",
         f"0{d10}",
         f"+91 {d10}",
-        f"{d10[:5]} {d10[5:]}",
-        f"+91 {d10[:5]} {d10[5:]}",
+        f"{p5_a} {p5_b}",
+        f"+91 {p5_a} {p5_b}",
     ]
     seen = set()
     ordered = []
@@ -463,6 +592,9 @@ def _safe_query(sql: str, params: list, source_name: str = "") -> list[dict]:
                 return []
 
 def db_search_main(number: str) -> list[dict]:
+    cached = _get_cached_source_search("people_phone", number)
+    if cached is not None:
+        return cached
     vname = "people_phone"
     if not _view_health.get(vname, True):
         try:
@@ -474,9 +606,14 @@ def db_search_main(number: str) -> list[dict]:
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_phone WHERE phoneNumber IN ({ph}) LIMIT 5"
-    return _safe_query(sql, vars_list, "KC-SOURCE-01")
+    res = _safe_query(sql, vars_list, "KC-SOURCE-01")
+    _set_cached_source_search("people_phone", number, res)
+    return res
 
 def db_search_umba(number: str) -> list[dict]:
+    cached = _get_cached_source_search("people_umba", number)
+    if cached is not None:
+        return cached
     vname = "people_umba"
     if not _view_health.get(vname, True):
         try:
@@ -488,9 +625,14 @@ def db_search_umba(number: str) -> list[dict]:
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_umba WHERE phoneNumber IN ({ph}) LIMIT 5"
-    return _safe_query(sql, vars_list, "KC-SOURCE-02")
+    res = _safe_query(sql, vars_list, "KC-SOURCE-02")
+    _set_cached_source_search("people_umba", number, res)
+    return res
 
 def db_search_bsnl(number: str) -> list[dict]:
+    cached = _get_cached_source_search("people_bsnl", number)
+    if cached is not None:
+        return cached
     vname = "people_bsnl"
     if not _view_health.get(vname, True):
         try:
@@ -502,9 +644,14 @@ def db_search_bsnl(number: str) -> list[dict]:
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_bsnl WHERE number IN ({ph}) LIMIT 5"
-    return _safe_query(sql, vars_list, "KC-SOURCE-03")
+    res = _safe_query(sql, vars_list, "KC-SOURCE-03")
+    _set_cached_source_search("people_bsnl", number, res)
+    return res
 
 def db_search_cars(number: str) -> list[dict]:
+    cached = _get_cached_source_search("people_cars", number)
+    if cached is not None:
+        return cached
     vname = "people_cars"
     if not _view_health.get(vname, True):
         try:
@@ -516,9 +663,14 @@ def db_search_cars(number: str) -> list[dict]:
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_cars WHERE mobile_no IN ({ph}) LIMIT 5"
-    return _safe_query(sql, vars_list, "KC-SOURCE-04")
+    res = _safe_query(sql, vars_list, "KC-SOURCE-04")
+    _set_cached_source_search("people_cars", number, res)
+    return res
 
 def db_search_air(number: str) -> list[dict]:
+    cached = _get_cached_source_search("people_air", number)
+    if cached is not None:
+        return cached
     vname = "people_air"
     if not _view_health.get(vname, True):
         try:
@@ -530,9 +682,14 @@ def db_search_air(number: str) -> list[dict]:
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_air WHERE number IN ({ph}) LIMIT 5"
-    return _safe_query(sql, vars_list, "KC-SOURCE-05")
+    res = _safe_query(sql, vars_list, "KC-SOURCE-05")
+    _set_cached_source_search("people_air", number, res)
+    return res
 
 def db_search_flipkart(number: str) -> list[dict]:
+    cached = _get_cached_source_search("people_flipkart", number)
+    if cached is not None:
+        return cached
     vname = "people_flipkart"
     if not _view_health.get(vname, True):
         try:
@@ -544,9 +701,14 @@ def db_search_flipkart(number: str) -> list[dict]:
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_flipkart WHERE phone IN ({ph}) LIMIT 5"
-    return _safe_query(sql, vars_list, "KC-SOURCE-06")
+    res = _safe_query(sql, vars_list, "KC-SOURCE-06")
+    _set_cached_source_search("people_flipkart", number, res)
+    return res
 
 def db_search_telegram(number: str) -> list[dict]:
+    cached = _get_cached_source_search("people_telegram", number)
+    if cached is not None:
+        return cached
     vname = "people_telegram"
     if not _view_health.get(vname, True):
         try:
@@ -558,7 +720,9 @@ def db_search_telegram(number: str) -> list[dict]:
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_telegram WHERE phone IN ({ph}) LIMIT 5"
-    return _safe_query(sql, vars_list, "KC-SOURCE-07")
+    res = _safe_query(sql, vars_list, "KC-SOURCE-07")
+    _set_cached_source_search("people_telegram", number, res)
+    return res
 
 # Compatibility alias
 db_search = db_search_main
@@ -592,6 +756,9 @@ def _init_sqlite() -> None:
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
             PRAGMA busy_timeout=5000;
+            PRAGMA cache_size=-64000;
+            PRAGMA temp_store=MEMORY;
+            PRAGMA mmap_size=268435456;
             CREATE TABLE IF NOT EXISTS users (
                 chat_id          INTEGER PRIMARY KEY,
                 name             TEXT,
@@ -633,6 +800,17 @@ def _init_sqlite() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER, agent_id INTEGER,
                 body TEXT, created_at REAL
             );
+            CREATE INDEX IF NOT EXISTS idx_users_premium ON users(is_premium, premium_until);
+            CREATE INDEX IF NOT EXISTS idx_users_referred ON users(referred_by);
+            CREATE INDEX IF NOT EXISTS idx_payments_utr ON payments(utr);
+            CREATE INDEX IF NOT EXISTS idx_payments_inv ON payments(invoice_id);
+            CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+            CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
+            CREATE INDEX IF NOT EXISTS idx_tickets_agent ON tickets(agent_id, status);
+            CREATE INDEX IF NOT EXISTS idx_replies_ticket ON ticket_replies(ticket_id);
+            CREATE INDEX IF NOT EXISTS idx_replies_agent ON ticket_replies(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
+            CREATE INDEX IF NOT EXISTS idx_ban_chat ON ban_history(chat_id);
             """
         )
         existing = {row[1] for row in _sql.execute("PRAGMA table_info(users)").fetchall()}
@@ -653,6 +831,13 @@ def _init_sqlite() -> None:
             if col not in pay_cols:
                 _sql.execute(ddl)
         _sql.commit()
+        try:
+            kv_rows = _sql.execute("SELECT k, v FROM kv").fetchall()
+            with _kv_cache_lock:
+                for kr in kv_rows:
+                    _kv_cache[kr["k"]] = kr["v"]
+        except Exception:
+            pass
 
 def _blank_user(cid: int, name: str | None, username: str | None) -> dict:
     return {
@@ -674,7 +859,7 @@ def _row_get(row: sqlite3.Row, key: str, default=None):
 
 def _from_row(row: sqlite3.Row) -> dict:
     try:
-        history = json.loads(row["history"] or "[]")
+        history = _json_loads(row["history"] or "[]")
         if not isinstance(history, list):
             history = []
     except Exception:
@@ -704,7 +889,7 @@ def _from_row(row: sqlite3.Row) -> dict:
 def _save_user(u: dict) -> None:
     if _sql is None:
         return
-    history = json.dumps(u.get("history") or [], ensure_ascii=False)
+    history = _json_dumps(u.get("history") or [])
     referred = u.get("referred_by")
     role = "SUPER_ADMIN" if int(u["id"]) == ADMIN_ID else (u.get("role") or "USER")
     if role not in ("SUPER_ADMIN", "FINANCE_MANAGER", "SUPPORT_AGENT", "USER"):
@@ -748,14 +933,30 @@ def _load_user(cid: int) -> dict | None:
         row = _sql.execute("SELECT * FROM users WHERE chat_id = ?", (cid,)).fetchone()
     return _from_row(row) if row else None
 
+_kv_cache: dict[str, str] = {}
+_kv_cache_lock = threading.RLock()
+_plans_cached: dict | None = None
+_plans_cached_raw: str | None = None
+
 def _kv_get(key: str, default: str = "") -> str:
+    with _kv_cache_lock:
+        if key in _kv_cache:
+            return _kv_cache[key]
     if _sql is None:
         return default
     with _sql_lock:
         row = _sql.execute("SELECT v FROM kv WHERE k = ?", (key,)).fetchone()
-    return row["v"] if row else default
+    val = row["v"] if row else default
+    with _kv_cache_lock:
+        _kv_cache[key] = val
+    return val
 
 def _kv_set(key: str, value: str) -> None:
+    with _kv_cache_lock:
+        _kv_cache[key] = value
+    if key == "PLANS":
+        global _plans_cached
+        _plans_cached = None
     if _sql is None:
         return
     with _sql_lock:
@@ -771,7 +972,7 @@ def _seed_settings() -> None:
     if _kv_get("FREE_DAILY_LIMIT", "") == "":
         _kv_set("FREE_DAILY_LIMIT", str(FREE_DAILY_LIMIT))
     if _kv_get("PLANS", "") == "":
-        _kv_set("PLANS", json.dumps(PLANS))
+        _kv_set("PLANS", _json_dumps(PLANS))
     for gw in ("upi", "stars", "crypto"):
         if _kv_get(f"gw:{gw}", "") == "":
             _kv_set(f"gw:{gw}", "1")
@@ -873,23 +1074,41 @@ def _get_ud(cid: int, name: str | None = None, username: str | None = None) -> d
         _save_user(u)
     return u
 
+_dirty_searches: set[int] = set()
+_dirty_searches_lock = threading.Lock()
+
+def _mark_user_searches_dirty(cid: int) -> None:
+    with _dirty_searches_lock:
+        _dirty_searches.add(cid)
+
 def _persist_loop() -> None:
     while True:
         time.sleep(3)
         if _sql is None:
             continue
+        with _dirty_searches_lock:
+            if not _dirty_searches:
+                continue
+            to_persist = list(_dirty_searches)
+            _dirty_searches.clear()
+
         with _sl:
-            snap = [(int(u["id"]), int(u.get("searches") or 0)) for u in user_data.values()]
-        for cid, searches in snap:
-            try:
-                with _sql_lock:
-                    _sql.execute(
-                        "UPDATE users SET total_searches = ? WHERE chat_id = ? AND COALESCE(total_searches, 0) < ?",
-                        (searches, cid, searches),
-                    )
-                    _sql.commit()
-            except Exception:
-                log.exception("persist failed")
+            batch = [
+                (int(user_data[c].get("searches") or 0), c)
+                for c in to_persist
+                if c in user_data
+            ]
+        if not batch:
+            continue
+        try:
+            with _sql_lock:
+                _sql.executemany(
+                    "UPDATE users SET total_searches = ? WHERE chat_id = ? AND COALESCE(total_searches, 0) < ?",
+                    [(s, c, s) for s, c in batch],
+                )
+                _sql.commit()
+        except Exception:
+            log.exception("persist failed")
 
 def _remember(cid: int, query: str, found: int) -> None:
     u = user_data.get(cid)
@@ -1080,21 +1299,40 @@ def send_photo(cid: int, photo: str, caption: str, kb=None) -> int | None:
 def edit_msg(cid: int, mid: int | None, text: str, kb=None) -> None:
     if not mid:
         return
+    h = _calc_msg_hash(text, kb)
+    key = (cid, mid)
+    with _msg_state_lock:
+        if _last_msg_state.get(key) == h:
+            return
     p: dict = {"chat_id": cid, "message_id": mid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if kb:
         p["reply_markup"] = {"inline_keyboard": kb}
-    tg("editMessageText", p)
+    res = tg("editMessageText", p)
+    if res.get("ok"):
+        with _msg_state_lock:
+            if len(_last_msg_state) >= _MSG_STATE_MAX:
+                _last_msg_state.pop(next(iter(_last_msg_state)), None)
+            _last_msg_state[key] = h
 
 def desk_edit(cid: int, mid: int | None, text: str, kb=None) -> None:
     if not mid:
         send_msg(cid, text, kb=kb)
         return
+    h = _calc_msg_hash(text, kb)
+    key = (cid, mid)
+    with _msg_state_lock:
+        if _last_msg_state.get(key) == h:
+            return
     p: dict = {"chat_id": cid, "message_id": mid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if kb:
         p["reply_markup"] = {"inline_keyboard": kb}
     res = tg("editMessageText", p)
     desc = str(res.get("description") or "")
     if res.get("ok") or "message is not modified" in desc:
+        with _msg_state_lock:
+            if len(_last_msg_state) >= _MSG_STATE_MAX:
+                _last_msg_state.pop(next(iter(_last_msg_state)), None)
+            _last_msg_state[key] = h
         return
     cap: dict = {"chat_id": cid, "message_id": mid, "caption": text[:1024], "parse_mode": "HTML"}
     if kb:
@@ -1102,8 +1340,14 @@ def desk_edit(cid: int, mid: int | None, text: str, kb=None) -> None:
     res2 = tg("editMessageCaption", cap)
     desc2 = str(res2.get("description") or "")
     if res2.get("ok") or "message is not modified" in desc2:
+        with _msg_state_lock:
+            if len(_last_msg_state) >= _MSG_STATE_MAX:
+                _last_msg_state.pop(next(iter(_last_msg_state)), None)
+            _last_msg_state[key] = h
         return
     tg("deleteMessage", {"chat_id": cid, "message_id": mid})
+    with _msg_state_lock:
+        _last_msg_state.pop(key, None)
     send_msg(cid, text, kb=kb)
 
 def answer_cb(cb_id: str, text: str | None = None, alert: bool = False) -> None:
@@ -1159,7 +1403,14 @@ def elapsed_label(secs: float) -> str:
     return f"⏱ {secs:.1f}s"
 
 def sv(v) -> str:
-    s = str(v).strip() if v is not None else ""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        s = v.strip()
+        return "" if s.lower() == "nan" else s
+    if isinstance(v, float) and (v != v):
+        return ""
+    s = str(v).strip()
     return "" if s.lower() == "nan" else s
 
 def q_bar(pos: int, cap: int = 10) -> str:
@@ -1169,7 +1420,7 @@ def q_bar(pos: int, cap: int = 10) -> str:
 
 def clean_addr(addr) -> str:
     if not addr: return ""
-    return re.sub(r"\s+", " ", re.sub(r"!+", ", ", str(addr))).strip(", ")
+    return _RE_WHITESPACE.sub(" ", _RE_EXCLAMATION.sub(", ", str(addr))).strip(", ")
 
 def fmt_td(secs: int) -> str:
     secs = max(0, int(secs))
@@ -1189,15 +1440,23 @@ def _free_limit() -> int:
     except ValueError: return FREE_DAILY_LIMIT
 
 def _plans() -> dict:
+    global _plans_cached, _plans_cached_raw
     raw = _kv_get("PLANS", "")
+    if raw == _plans_cached_raw and _plans_cached is not None:
+        return _plans_cached
     if raw:
         try:
-            data = json.loads(raw)
+            data = _json_loads(raw)
             if isinstance(data, dict) and data:
+                _plans_cached = data
+                _plans_cached_raw = raw
                 return data
         except Exception:
             pass
-    return {k: dict(v) for k, v in PLANS.items()}
+    fallback = {k: dict(v) for k, v in PLANS.items()}
+    _plans_cached = fallback
+    _plans_cached_raw = ""
+    return fallback
 
 def _gw_on(gw: str) -> bool: return _kv_get(f"gw:{gw}", "1") != "0"
 def _daily_used(u: dict) -> int:
@@ -1267,15 +1526,23 @@ def _clear_flow(cid: int) -> None: flow.pop(cid, None)
 
 def _chat_ref(channel: str):
     s = str(channel).strip()
-    return int(s) if re.fullmatch(r"-?\d+", s) else s
+    return int(s) if _RE_INT.fullmatch(s) else s
 
 def _channel_link(ch: str) -> str | None:
     s = str(ch).strip()
     if s.startswith(("http://", "https://")): return s
     if s.startswith("@"): return "https://t.me/" + s[1:]
+    if _RE_CHANNEL_ID.fullmatch(s): return "https://t.me/c/" + s[4:]
     return None
 
 def _member_of(cid: int, channel: str) -> bool:
+    now = time.time()
+    cache_key = (cid, str(channel))
+    with _member_cache_lock:
+        cached = _member_cache.get(cache_key)
+        if cached and (now - cached[0] < _MEMBER_CACHE_TTL) and cached[1] is True:
+            return True
+
     data = tg("getChatMember", {"chat_id": _chat_ref(channel), "user_id": cid})
     if not data or not data.get("ok"):
         desc = str((data or {}).get("description") or "").lower()
@@ -1283,11 +1550,21 @@ def _member_of(cid: int, channel: str) -> bool:
         if kicked and channel not in _chan_fail:
             _chan_fail.add(channel)
             send_msg(ADMIN_ID, "Bhai bot channel se nikal diya gaya: <code>" + _e(str(channel)) + "</code>. Fail-open ON.")
-        return True if kicked else False
+        res = True if kicked else False
+        if res:
+            with _member_cache_lock:
+                _member_cache[cache_key] = (now, True)
+        return res
     result = data.get("result") or {}
     status = result.get("status", "")
-    if status in ("creator", "administrator", "member"): return True
-    return status == "restricted" and bool(result.get("is_member"))
+    is_mem = False
+    if status in ("creator", "administrator", "member"):
+        is_mem = True
+    elif status == "restricted" and bool(result.get("is_member")):
+        is_mem = True
+    with _member_cache_lock:
+        _member_cache[cache_key] = (now, is_mem)
+    return is_mem
 
 def _needs_join(cid: int) -> bool:
     if cid == ADMIN_ID or not FORCE_CHANNELS: return False
@@ -1432,7 +1709,7 @@ def _gateway_kb(plan_id: str):
     rows.append([{"text": "❌ Cancel", "callback_data": "paycancel"}, {"text": "🔙 Wapas", "callback_data": "premium"}])
     return rows
 
-def result_kb(page: int, total: int):
+def result_kb(page: int, total: int, query: str = ""):
     rows = []
     if total > 1:
         nav = []
@@ -2071,7 +2348,7 @@ def send_receipt(cid: int, user: dict, plan: dict, when: str, expiry: str, utr: 
 def _apply_referral(cid: int, payload: str) -> None:
     if _sql is None:
         return
-    match = re.fullmatch(r"ref_(\d+)", (payload or "").strip())
+    match = _RE_REF.fullmatch((payload or "").strip())
     if not match:
         return
     inviter_id = int(match.group(1))
@@ -2814,7 +3091,7 @@ def _admin_editplan(cid: int, raw: str) -> None:
     if name:
         plan["name"] = name
     plans[pid] = plan
-    _kv_set("PLANS", json.dumps(plans))
+    _kv_set("PLANS", _json_dumps(plans))
     blurb = f"{plan['name']} ab ₹{plan['amount']} ka hai, {plan['days']} din, {plan['stars']} stars."
     flow[cid] = {"mode": "PLAN_BCAST", "blurb": blurb, "ts": time.time()}
     send_msg(
@@ -3600,35 +3877,42 @@ def worker() -> None:
 
             def _make_fetcher(src_def: dict):
                 def _fetch():
+                    s_id = src_def["id"]
+                    cached = _get_cached_source_search(s_id, query)
+                    if cached is not None:
+                        all_sources[s_id] = cached
+                        return
                     with _source_semaphore:
                         try:
-                            all_sources[src_def["id"]] = src_def["search_fn"](query)
+                            res = src_def["search_fn"](query)
+                            all_sources[s_id] = res
+                            _set_cached_source_search(s_id, query, res)
                         except Exception as ex:
-                            log.warning("Source %s query error: %s", src_def["id"], ex)
-                            all_sources[src_def["id"]] = []
+                            log.warning("Source %s query error: %s", s_id, ex)
+                            all_sources[s_id] = []
                 return _fetch
 
-            deadline = time.monotonic() + SYS_SEARCH_TIMEOUT
             t_db = time.monotonic()
-            threads = [
-                (s, threading.Thread(target=_make_fetcher(s), daemon=True))
+            deadline = t_db + SYS_SEARCH_TIMEOUT
+            futures = {
+                _source_executor.submit(_make_fetcher(s)): s
                 for s in active_sources
-            ]
-            for _, th in threads:
-                th.start()
+            }
 
-            while time.monotonic() < deadline:
-                all_done = all(not th.is_alive() for _, th in threads)
+            while futures and time.monotonic() < deadline:
+                step = min(0.05, max(0.001, deadline - time.monotonic()))
+                done, not_done = concurrent.futures.wait(
+                    futures.keys(), timeout=step, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                futures = {f: futures[f] for f in not_done}
                 found_count = sum(1 for s in active_sources if all_sources.get(s["id"]))
-                if all_done:
+                if not futures:
                     break
-                # Progressive early return if searching all directories
                 if len(active_sources) > 1 and found_count >= 2 and (time.monotonic() - t_db >= 4.0):
                     break
-                time.sleep(0.2)
 
-            for s, th in threads:
-                if th.is_alive():
+            for f, s in futures.items():
+                if not f.done():
                     log.warning("Source %s query timed out", s["id"])
                     all_sources[s["id"]] = []
 
@@ -3638,6 +3922,7 @@ def worker() -> None:
                 global_stats["searches"] += 1
                 if cid in user_data:
                     user_data[cid]["searches"] += 1
+            _mark_user_searches_dirty(cid)
 
             total_found = sum(len(r) for r in all_sources.values())
             max_pages = max([len(r) for r in all_sources.values() if r] or [0])
@@ -3669,8 +3954,6 @@ def worker() -> None:
                     }
 
                 page_0_data = {k: (v[0] if v else None) for k, v in all_sources.items()}
-                edit_msg(cid, mid, msg_stage(query, "✅ Match mil gaya!"))
-                time.sleep(0.2)
                 edit_msg(
                     cid, mid,
                     format_card_sources(page_0_data, query, elapsed),
@@ -4059,6 +4342,9 @@ def handle_cb(cb: dict) -> None:
         return
 
     if data == "verify":
+        with _member_cache_lock:
+            for ch in FORCE_CHANNELS:
+                _member_cache.pop((cid, str(ch)), None)
         if _needs_join(cid):
             desk_edit(cid, mid, msg_force() + "\n\nAbhi bhi channel baaki hai. Join kar, phir verify daba.", kb=force_kb())
             return
@@ -4369,6 +4655,14 @@ def handle_msg(msg: dict) -> None:
         send_msg(cid, _MAINT_TEXT)
         return
 
+    if cid == ADMIN_ID and msg.get("reply_to_message") and raw:
+        target = support_routes.get(msg["reply_to_message"].get("message_id"))
+        if target:
+            send_msg(target, f"<b>Desk se jawab</b>\n\n{_e(raw)}")
+            send_msg(cid, "Member ke paas pahunch gaya.")
+            return
+
+
     state = flow.get(cid) or {}
     mode = state.get("mode")
 
@@ -4410,7 +4704,7 @@ def handle_msg(msg: dict) -> None:
             _clear_flow(cid)
             send_msg(cid, "Woh checkout expire ho gaya. Premium khol ke term phir choose kar.", kb=dashboard_kb())
             return
-        if not re.fullmatch(r"\d{12}", raw):
+        if not _RE_UTR.fullmatch(raw):
             send_msg(cid, "Reference exactly 12 digit ka hona chahiye. Sirf UTR bhej.")
             return
         with _sl:
@@ -4430,7 +4724,7 @@ def handle_msg(msg: dict) -> None:
             _clear_flow(cid)
             send_msg(cid, "Crypto checkout expire ho gaya. Premium khol ke phir try kar.", kb=dashboard_kb())
             return
-        if not re.fullmatch(r"[A-Za-z0-9]{16,80}", raw):
+        if not _RE_TX.fullmatch(raw):
             send_msg(cid, "Bhai sahi tx hash bhej. 16 se 80 letters ya digits. UTR nahi, crypto hash.")
             return
         with _sl:
@@ -4510,33 +4804,37 @@ def handle_msg(msg: dict) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LONG POLLING & FASTAPI
 # ═══════════════════════════════════════════════════════════════════════════════
+def _dispatch_update(upd: dict) -> None:
+    try:
+        if "callback_query" in upd:
+            handle_cb(upd["callback_query"])
+        elif "pre_checkout_query" in upd:
+            handle_pre_checkout(upd["pre_checkout_query"])
+        elif "message" in upd:
+            handle_msg(upd["message"])
+    except Exception:
+        log.exception("Update handler crash")
+
 def poll_telegram() -> None:
     try:
         _session.get(f"{BASE_URL}/deleteWebhook?drop_pending_updates=false", timeout=5)
     except Exception:
         pass
     offset, backoff = None, 1
+    allowed = urllib.parse.quote(json.dumps(["message", "callback_query", "pre_checkout_query"]))
     while True:
         try:
-            allowed = urllib.parse.quote(json.dumps(["message", "callback_query", "pre_checkout_query"]))
             url = f"{BASE_URL}/getUpdates?timeout=30&allowed_updates={allowed}" + (f"&offset={offset}" if offset else "")
-            resp = _session.get(url, timeout=35).json()
+            resp = _poll_session.get(url, timeout=35).json()
             if not resp.get("ok"):
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
             backoff = 1
-            for upd in resp.get("result", []):
+            results = resp.get("result", [])
+            for upd in results:
                 offset = upd["update_id"] + 1
-                try:
-                    if "callback_query" in upd:
-                        handle_cb(upd["callback_query"])
-                    elif "pre_checkout_query" in upd:
-                        handle_pre_checkout(upd["pre_checkout_query"])
-                    elif "message" in upd:
-                        handle_msg(upd["message"])
-                except Exception:
-                    log.exception("Update handler crash")
+                _update_executor.submit(_dispatch_update, upd)
         except requests.RequestException:
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
@@ -4555,20 +4853,26 @@ def _startup_health() -> None:
         reasons.append("users.db missing hai. /restore se file daal, ya /initdb se fresh start kar.")
 
     test_num = "7417679558"
-    failed_count = 0
-    for src in SOURCES:
+
+    def _check_source(src):
         s_id = src["id"]
         vname = _SRC_VIEW_MAP.get(s_id, "")
         try:
             res = src["search_fn"](test_num)
             if (vname and not _view_health.get(vname, True)) or _source_query_error.get(src["name"], False):
-                failed_count += 1
                 log.warning("Startup health %s (%s): FAIL", s_id, src["name"])
+                return False
             else:
                 log.info("Startup health %s (%s): PASS", s_id, src["name"])
+                return True
         except Exception as exc:
-            failed_count += 1
             log.warning("Startup health %s (%s): FAIL (%s)", s_id, src["name"], exc)
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(7, len(SOURCES))) as exc_pool:
+        check_results = list(exc_pool.map(_check_source, SOURCES))
+
+    failed_count = check_results.count(False)
 
     if failed_count >= 5:
         MAINTENANCE = True
@@ -4586,57 +4890,26 @@ def _startup_health() -> None:
 
 _startup_health()
 
-for _fn in [worker, poll_telegram, _broadcaster, _session_gc, _persist_loop, _backup_loop, _expiry_loop]:
+for _fn in [poll_telegram, _broadcaster, _session_gc, _persist_loop, _backup_loop, _expiry_loop]:
     threading.Thread(target=_fn, daemon=True).start()
+
+for _ in range(2):
+    threading.Thread(target=worker, daemon=True).start()
 
 if __name__ == "__main__":
     try:
         import uvicorn
-        uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")), log_level="info")
+        port = int(os.getenv("PORT", "8080"))
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", port))
+            s.close()
+        except OSError:
+            os.system(f"fuser -k {port}/tcp 2>/dev/null")
+            time.sleep(0.5)
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
     except Exception:
         log.exception("http server failed, exiting process")
         sys.exit(1)
-
-import uvicorn
-from fastapi import FastAPI
-
-from kc import shared, background, polling, worker as worker_mod
-import kc.duckdb_conn as duckdb_conn
-import kc.sqlite_db as sqlite_db
-from kc.config import ADMIN_ID
-from kc.logging_setup import log
-
-app = FastAPI(title="KaramChand", docs_url=None, redoc_url=None)
-
-
-@app.api_route("/", methods=["GET", "HEAD"])
-def health():
-    return {
-        "status": "alive",
-        "queue": shared._search_q.qsize(),
-        "maintenance": shared.MAINTENANCE,
-    }
-
-
-# --- Bootstrap DBs (must run before threads start) ---
-sqlite_db.bootstrap()
-duckdb_conn.bootstrap()
-
-# --- Background threads — health check runs in background, does not block $PORT ---
-threading.Thread(target=background.startup_health, daemon=True).start()
-
-for fn in [
-    worker_mod.worker,
-    polling.poll_telegram,
-    background.broadcaster,
-    background.session_gc,
-    background.persist_loop,
-    background.backup_loop,
-    background.expiry_loop,
-]:
-    threading.Thread(target=fn, daemon=True).start()
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")), log_level="info")
-
