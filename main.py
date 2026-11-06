@@ -76,17 +76,17 @@ BASE_HF_CAR      = os.getenv("BASE_HF_CAR",      "hf://buckets/Khanenterprises/C
 BASE_HF_AIR      = os.getenv("BASE_HF_AIR",      "hf://buckets/Khanenterprises/Umbaairbucket/data.parquet")
 BASE_HF_FLIP     = os.getenv("BASE_HF_FLIP",     "hf://buckets/Khanenterprises/Umbaflip-bucket/flipkart.parquet")
 BASE_HF_TG       = os.getenv("BASE_HF_TG",       "hf://buckets/Khanenterprises/Umbat-bucket/TELEGRAM_MASTER_DB.parquet")
-DUCKDB_MEM_LIMIT = os.getenv("DUCKDB_MEM_LIMIT", "500MB")
-DUCKDB_THREADS   = int(os.getenv("DUCKDB_THREADS", "4"))
+DUCKDB_MEM_LIMIT = os.getenv("DUCKDB_MEM_LIMIT", "200MB")
+DUCKDB_THREADS   = int(os.getenv("DUCKDB_THREADS", "1"))
 BASE_URL         = f"https://api.telegram.org/bot{TOKEN}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MANUAL SYSTEM CONFIGURATION (TUNE HERE FOR ANY SERVER / HOSTING SPECS)
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configure your server architecture settings manually here (or via environment variables):
-SYS_RAM_LIMIT          = os.getenv("SYS_RAM_LIMIT",          "350MB")  # DuckDB memory limit (e.g. '300MB', '500MB', '1GB', '2GB')
-SYS_CPU_THREADS        = int(os.getenv("SYS_CPU_THREADS",    "2"))      # CPU worker threads for DuckDB (e.g. 1, 2, 4)
-SYS_CONCURRENT_SOURCES = int(os.getenv("SYS_CONCURRENT_SOURCES", "7"))  # Max sources queried at a time (1 to 7). Set 2 or 3 for 512MB Render!
+SYS_RAM_LIMIT          = os.getenv("SYS_RAM_LIMIT",          "200MB")  # DuckDB memory limit (e.g. '300MB', '500MB', '1GB', '2GB')
+SYS_CPU_THREADS        = int(os.getenv("SYS_CPU_THREADS",    "1"))      # CPU worker threads for DuckDB (e.g. 1, 2, 4)
+SYS_CONCURRENT_SOURCES = int(os.getenv("SYS_CONCURRENT_SOURCES", "2"))  # Max sources queried at a time (1 to 7). Set 2 or 3 for 512MB Render!
 SYS_SEARCH_TIMEOUT     = float(os.getenv("SYS_SEARCH_TIMEOUT", "120.0")) # Query search timeout in seconds
 SYS_MAX_QUEUE          = int(os.getenv("SYS_MAX_QUEUE",      "20"))     # Maximum search queue capacity
 SYS_HTTP_TIMEOUT_MS    = int(os.getenv("SYS_HTTP_TIMEOUT_MS", "120000")) # DuckDB remote parquet HTTP timeout (ms)
@@ -233,13 +233,13 @@ _poll_session.headers.update({"Connection": "keep-alive"})
 
 # Thread pool for asynchronous, non-blocking processing of incoming Telegram updates
 _update_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=32,
+    max_workers=8,
     thread_name_prefix="tg-worker"
 )
 
 # Persistent thread pool for concurrent multi-source queries
 _source_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=max(7, SYS_CONCURRENT_SOURCES),
+    max_workers=max(2, SYS_CONCURRENT_SOURCES),
     thread_name_prefix="src-fetch"
 )
 
@@ -756,9 +756,9 @@ def _init_sqlite() -> None:
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
             PRAGMA busy_timeout=5000;
-            PRAGMA cache_size=-64000;
+            PRAGMA cache_size=-4000;
             PRAGMA temp_store=MEMORY;
-            PRAGMA mmap_size=268435456;
+            PRAGMA mmap_size=16777216;
             CREATE TABLE IF NOT EXISTS users (
                 chat_id          INTEGER PRIMARY KEY,
                 name             TEXT,
@@ -4869,8 +4869,14 @@ def _startup_health() -> None:
             log.warning("Startup health %s (%s): FAIL (%s)", s_id, src["name"], exc)
             return False
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(7, len(SOURCES))) as exc_pool:
-        check_results = list(exc_pool.map(_check_source, SOURCES))
+    # Run health check sequentially with concurrency limit to prevent memory spikes on 512MB RAM
+    check_results = []
+    for s in SOURCES:
+        try:
+            check_results.append(_check_source(s))
+        except Exception:
+            check_results.append(False)
+        time.sleep(0.1)
 
     failed_count = check_results.count(False)
 
@@ -4888,7 +4894,8 @@ def _startup_health() -> None:
         MAINTENANCE = False
         log.info("health check ok — maintenance OFF")
 
-_startup_health()
+# Run startup health and background workers in daemon threads to allow instant port binding
+threading.Thread(target=_startup_health, daemon=True).start()
 
 for _fn in [poll_telegram, _broadcaster, _session_gc, _persist_loop, _backup_loop, _expiry_loop]:
     threading.Thread(target=_fn, daemon=True).start()
