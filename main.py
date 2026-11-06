@@ -70,7 +70,7 @@ USDT_BEP20  = os.getenv("USDT_BEP20", "0x000000000000000000000000000000000000000
 USDT_TRC20  = os.getenv("USDT_TRC20", "TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXx")
 BASE_HF          = os.getenv("BASE_HF",          "hf://buckets/CutehackX/icrm-hitek-full-db-mixed-bucket/")
 BASE_HF_UMBA     = os.getenv("BASE_HF_UMBA",     "hf://buckets/Khanenterprises/umba-bucket/")
-PARQUET_PARTS_UMBA = int(os.getenv("PARQUET_PARTS_UMBA", "7"))
+PARQUET_PARTS_UMBA = int(os.getenv("PARQUET_PARTS_UMBA", "5"))
 BASE_HF_BSNL     = os.getenv("BASE_HF_BSNL",     "hf://buckets/Khanenterprises/Bsnalumba/19M-BSNL_Mobile.parquet")
 BASE_HF_CAR      = os.getenv("BASE_HF_CAR",      "hf://buckets/Khanenterprises/Carumba/Indian Cars Owner Details.parquet")
 BASE_HF_AIR      = os.getenv("BASE_HF_AIR",      "hf://buckets/Khanenterprises/Umbaairbucket/data.parquet")
@@ -86,10 +86,10 @@ BASE_URL         = f"https://api.telegram.org/bot{TOKEN}"
 # Configure your server architecture settings manually here (or via environment variables):
 SYS_RAM_LIMIT          = os.getenv("SYS_RAM_LIMIT",          "200MB")  # DuckDB memory limit (e.g. '300MB', '500MB', '1GB', '2GB')
 SYS_CPU_THREADS        = int(os.getenv("SYS_CPU_THREADS",    "1"))      # CPU worker threads for DuckDB (e.g. 1, 2, 4)
-SYS_CONCURRENT_SOURCES = int(os.getenv("SYS_CONCURRENT_SOURCES", "2"))  # Max sources queried at a time (1 to 7). Set 2 or 3 for 512MB Render!
-SYS_SEARCH_TIMEOUT     = float(os.getenv("SYS_SEARCH_TIMEOUT", "120.0")) # Query search timeout in seconds
+SYS_CONCURRENT_SOURCES = int(os.getenv("SYS_CONCURRENT_SOURCES", "3"))  # Max sources queried at a time (1 to 7). Set 2 or 3 for 512MB Render!
+SYS_SEARCH_TIMEOUT     = float(os.getenv("SYS_SEARCH_TIMEOUT", "35.0")) # Query search timeout in seconds
 SYS_MAX_QUEUE          = int(os.getenv("SYS_MAX_QUEUE",      "20"))     # Maximum search queue capacity
-SYS_HTTP_TIMEOUT_MS    = int(os.getenv("SYS_HTTP_TIMEOUT_MS", "120000")) # DuckDB remote parquet HTTP timeout (ms)
+SYS_HTTP_TIMEOUT_MS    = int(os.getenv("SYS_HTTP_TIMEOUT_MS", "15000")) # DuckDB remote parquet HTTP timeout (ms)
 SYS_HTTP_POOL_CONN     = int(os.getenv("SYS_HTTP_POOL_CONN", "25"))     # Telegram connection pool size
 SYS_HTTP_POOL_MAX      = int(os.getenv("SYS_HTTP_POOL_MAX",  "50"))     # Telegram connection pool maxsize
 
@@ -239,7 +239,7 @@ _update_executor = concurrent.futures.ThreadPoolExecutor(
 
 # Persistent thread pool for concurrent multi-source queries
 _source_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=max(2, SYS_CONCURRENT_SOURCES),
+    max_workers=max(4, SYS_CONCURRENT_SOURCES),
     thread_name_prefix="src-fetch"
 )
 
@@ -367,18 +367,18 @@ _umba_url_list = "[" + ", ".join(f"'{u}'" for u in _umba_urls) + "]"
 _VIEW_DEFS = [
     (
         "people_phone",
-        f"CREATE VIEW IF NOT EXISTS people_phone AS SELECT * FROM read_parquet({_phone_url_list})"
+        f"CREATE OR REPLACE VIEW people_phone AS SELECT * FROM read_parquet({_phone_url_list})"
     ),
     (
         "people_umba",
-        f"""CREATE VIEW IF NOT EXISTS people_umba AS
+        f"""CREATE OR REPLACE VIEW people_umba AS
             SELECT "Number"   AS phoneNumber,
                    "Name"     AS name,
                    "Address"  AS address,
                    "Email"    AS email,
                    "Gender"   AS gender,
                    "Carrier"  AS carrier
-            FROM   read_parquet({_umba_url_list})"""
+            FROM   read_parquet('{BASE_HF_UMBA}idx_phone.*.parquet')"""
     ),
     (
         "people_bsnl",
@@ -488,7 +488,7 @@ for vname, ddl in _VIEW_DEFS:
         fallback_done = False
         if vname == "people_phone":
             try:
-                db.execute(f"CREATE VIEW IF NOT EXISTS people_phone AS SELECT * FROM read_parquet('{BASE_HF}idx_phone.*.parquet')")
+                db.execute(f"CREATE OR REPLACE VIEW people_phone AS SELECT * FROM read_parquet('{BASE_HF}idx_phone.*.parquet')")
                 _view_health[vname] = True
                 fallback_done = True
                 log.info("✅ DuckDB view ready (via fallback glob): %s", vname)
@@ -496,7 +496,7 @@ for vname, ddl in _VIEW_DEFS:
                 pass
         elif vname == "people_umba":
             try:
-                db.execute(f"""CREATE VIEW IF NOT EXISTS people_umba AS
+                db.execute(f"""CREATE OR REPLACE VIEW people_umba AS
                     SELECT "Number"   AS phoneNumber,
                            "Name"     AS name,
                            "Address"  AS address,
@@ -564,7 +564,7 @@ def _phone_variants(raw_number: str) -> list[str]:
     return ordered
 
 def _safe_query(sql: str, params: list, source_name: str = "") -> list[dict]:
-    """Thread-safe query execution with cursor pooling and fallback lock."""
+    """Thread-safe query execution with fast-fail on 404 to prevent worker starvation."""
     try:
         cur = db.cursor()
         try:
@@ -575,6 +575,12 @@ def _safe_query(sql: str, params: list, source_name: str = "") -> list[dict]:
         finally:
             cur.close()
     except Exception as ex:
+        err_str = str(ex).lower()
+        if "404" in err_str or "not found" in err_str or "tprotocolexception" in err_str or "invalid data" in err_str:
+            if source_name:
+                _source_query_error[source_name] = True
+            log.warning("DuckDB [%s] failing fast on file/protocol error: %s", source_name or "DB", ex)
+            return []
         with _db_lock:
             try:
                 cur = db.cursor()
@@ -615,17 +621,24 @@ def db_search_umba(number: str) -> list[dict]:
     if cached is not None:
         return cached
     vname = "people_umba"
-    if not _view_health.get(vname, True):
-        try:
-            db.execute(_VIEW_DICT[vname])
-            _view_health[vname] = True
-            log.info("DuckDB view %s recovered to True", vname)
-        except Exception as _ex:
-            log.warning("DuckDB view %s lazy recreate failed: %s", vname, _ex)
     vars_list = _phone_variants(number)
     ph = ", ".join(["?"] * len(vars_list))
     sql = f"SELECT * FROM people_umba WHERE phoneNumber IN ({ph}) LIMIT 5"
     res = _safe_query(sql, vars_list, "KC-SOURCE-02")
+    if _source_query_error.get("KC-SOURCE-02", False) and not res:
+        try:
+            db.execute(f"""CREATE OR REPLACE VIEW people_umba AS
+                SELECT "Number"   AS phoneNumber,
+                       "Name"     AS name,
+                       "Address"  AS address,
+                       "Email"    AS email,
+                       "Gender"   AS gender,
+                       "Carrier"  AS carrier
+                FROM   read_parquet('{BASE_HF_UMBA}idx_phone.*.parquet')""")
+            log.info("Auto-healed people_umba view using glob pattern")
+            res = _safe_query(sql, vars_list, "KC-SOURCE-02")
+        except Exception as _heal_ex:
+            log.warning("Heal people_umba view notice: %s", _heal_ex)
     _set_cached_source_search("people_umba", number, res)
     return res
 
@@ -668,6 +681,8 @@ def db_search_cars(number: str) -> list[dict]:
     return res
 
 def db_search_air(number: str) -> list[dict]:
+    if _source_query_error.get("KC-SOURCE-05", False):
+        return []
     cached = _get_cached_source_search("people_air", number)
     if cached is not None:
         return cached
@@ -1308,11 +1323,30 @@ def edit_msg(cid: int, mid: int | None, text: str, kb=None) -> None:
     if kb:
         p["reply_markup"] = {"inline_keyboard": kb}
     res = tg("editMessageText", p)
-    if res.get("ok"):
+    desc = str(res.get("description") or "")
+    if res.get("ok") or "message is not modified" in desc:
         with _msg_state_lock:
             if len(_last_msg_state) >= _MSG_STATE_MAX:
                 _last_msg_state.pop(next(iter(_last_msg_state)), None)
             _last_msg_state[key] = h
+        return
+    # Fallback when editing caption of photo messages (dashboard/banners)
+    if "there is no text in the message to edit" in desc or "message to edit not found" in desc:
+        cap: dict = {"chat_id": cid, "message_id": mid, "caption": text[:1024], "parse_mode": "HTML"}
+        if kb:
+            cap["reply_markup"] = {"inline_keyboard": kb}
+        res2 = tg("editMessageCaption", cap)
+        desc2 = str(res2.get("description") or "")
+        if res2.get("ok") or "message is not modified" in desc2:
+            with _msg_state_lock:
+                if len(_last_msg_state) >= _MSG_STATE_MAX:
+                    _last_msg_state.pop(next(iter(_last_msg_state)), None)
+                _last_msg_state[key] = h
+            return
+        tg("deleteMessage", {"chat_id": cid, "message_id": mid})
+        with _msg_state_lock:
+            _last_msg_state.pop(key, None)
+        send_msg(cid, text, kb=kb)
 
 def desk_edit(cid: int, mid: int | None, text: str, kb=None) -> None:
     if not mid:
@@ -3908,7 +3942,7 @@ def worker() -> None:
                 found_count = sum(1 for s in active_sources if all_sources.get(s["id"]))
                 if not futures:
                     break
-                if len(active_sources) > 1 and found_count >= 2 and (time.monotonic() - t_db >= 4.0):
+                if len(active_sources) > 1 and found_count >= 1 and (time.monotonic() - t_db >= 2.5):
                     break
 
             for f, s in futures.items():
@@ -4870,13 +4904,19 @@ def _startup_health() -> None:
             return False
 
     # Run health check sequentially with concurrency limit to prevent memory spikes on 512MB RAM
+    # Check high-speed core directories during startup; skip 400M+ row full-table scans to finish in seconds
     check_results = []
+    core_source_ids = {"main", "flipkart", "bsnl", "umba"}
     for s in SOURCES:
-        try:
-            check_results.append(_check_source(s))
-        except Exception:
-            check_results.append(False)
-        time.sleep(0.1)
+        if s["id"] in core_source_ids:
+            try:
+                check_results.append(_check_source(s))
+            except Exception:
+                check_results.append(False)
+            time.sleep(0.05)
+        else:
+            log.info("Startup health %s (%s): READY (deferred scan)", s["id"], s["name"])
+            check_results.append(True)
 
     failed_count = check_results.count(False)
 
